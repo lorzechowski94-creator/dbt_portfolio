@@ -1,0 +1,9 @@
+parent_wtpart_master_key1,parent_wtpart_master_key,parent_part_view,parent_part_number,wtpart_usage_key,component_wtpart_master_key,part_number,part_name,part_view,component_quantity,spare_part_indicator,lowest_replaceable_unit,reference_designator
+100,100,Design,BK-100,1001,200,FR-200,Frame,Design,1,false,false,
+100,100,Design,BK-100,1002,300,WH-300,Wheel,Design,1,false,true,FRONT
+100,100,Design,BK-100,1003,300,WH-300,Wheel,Design,1,false,true,REAR
+300,300,Design,WH-300,1004,310,SP-310,Spoke,Design,32,true,false,
+300,300,Design,WH-300,1005,320,RM-320,Rim,Design,1,false,false,
+200,200,Design,FR-200,1006,400,BT-400,Bolt,Design,4,true,false,
+100,100,Manufacturing,BK-100,2001,200,FR-200,Frame,Manufacturing,1,false,false,
+200,200,Manufacturing,FR-200,2002,400,BT-400,Bolt,Manufacturing,4,true,false,

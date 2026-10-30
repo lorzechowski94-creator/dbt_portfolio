@@ -115,3 +115,13 @@ models:
       +persist_docs:
         relation: true
         columns: true
+
+# Sample input of models/marts/mart__bom_explosion.sql, a self-contained PLM
+# example with no care in it. Tagged shared like the mart that reads it, so both
+# build once per account, in the second phase.
+seeds:
+  care_analytics:
+    bom:
+      +database: ANALYTICS_MART
+      +schema: bom
+      +tags: ['shared']

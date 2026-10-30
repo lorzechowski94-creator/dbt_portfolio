@@ -1,0 +1,28 @@
+version: 2
+
+# Sample input for models/marts/mart__bom_explosion.sql: a bike in the Design and
+# Manufacturing views. Small on purpose, it holds exactly the cases the model has
+# to get right: one assembly used twice under the same parent (the FRONT and REAR
+# wheel), children with no reference designator of their own, and an iteration
+# that is not the latest and must be ignored (the Service bike).
+#
+# The aliases keep the relation names bare: macros/generate_alias_name.sql
+# prefixes every non-model node with the care token otherwise.
+seeds:
+  - name: material_bom
+    description: >
+      One row per usage link: a parent part (master key + view) uses a component
+      part with a quantity, a reference designator and spare-part / lowest
+      replaceable unit flags. parent_wtpart_master_key1 is the join key the
+      explosion follows; parent_wtpart_master_key is the same parent, reported.
+    config:
+      alias: material_bom
+      column_types:
+        component_quantity: number(13, 3)
+  - name: part_version
+    description: >
+      One row per part iteration and view. latest_view_iteration marks the
+      iteration each view currently uses; those are the top-level parts the
+      explosion starts from.
+    config:
+      alias: part_version

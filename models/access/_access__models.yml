@@ -1,0 +1,138 @@
+version: 2
+
+models:
+  - name: meta_customer_role_map
+    description: >
+      Which (source, company, location) each Snowflake reader role may see — the
+      table customer_access_filter evaluates inside every customer-facing secure
+      view, the per-care raw_access views and the account-wide report views alike.
+
+      Derived from every care's `location` table rather than maintained by hand,
+      so a new location or company is covered by the next refresh instead of
+      needing a CSV edit that nobody remembers. The one hand-kept part is the
+      company groups below, and even they list companies, not locations.
+
+      THREE ROLE FAMILIES OVER THE SAME ROWS, because the grain is
+      (role, source, location) and the filter only asks "does a row match":
+        ANALYTICS__CARE1_02_READER       — every location company 2 owns in care1,
+                                          and its rows with no location.
+        ANALYTICS__CARE1_02_L35_READER   — location 35 of company 2 in care1, and
+                                          nothing else.
+        ANALYTICS__CARE2_120_124_READER  — a company group: everything the
+                                          company-wide roles of 120 and 124 in
+                                          care2 see, in one role.
+      Which scope someone gets is decided by WHICH ROLE IS GRANTED, not by this
+      model or the filter. Roles are created by hand in Snowflake, outside this
+      repo, so emitting a row for a role nobody created is inert — the narrow
+      family can sit here unused until a customer asks for it.
+
+      COMPANY GROUPS are for a customer that owns several companies and wants to
+      query them together (asked for 2026-10-19: companies 120 and 124 in care2).
+      Two company-wide roles cannot do that, because the filter matches
+      current_role() exactly (see below). A group is listed by hand in the
+      model's company_group CTE, one row per (role, company), and named
+      ANALYTICS__<CARE>_<company ids>_READER. A group covers ONE care: location ids
+      collide across cares, so a group spanning two would repeat
+      (role_name, location_id) and fail the model's uniqueness test.
+
+      THE CARE IS IN THE NAME, as a prefix naming the source schema the rows come
+      from (CARE1 = ANALYTICS_RAW.CARE1; ALPHA and ALPHA2 for the R3 account). Until
+      2026-10 the names carried no care (ANALYTICS_02_READER) and one role spanned
+      every care of the account that held its company. For the narrow family that
+      meant a colliding location id was granted in BOTH cares: location.id is
+      allocated per care, and on the R2 account 103 (company, location) pairs
+      exist in more than one care, 25 of them with different names (id 1 is
+      "Demo" in care2 and "Aged Care" in care5). With the prefix, a grant names
+      exactly one source schema. A customer present in two cares needs two roles,
+      and a session sees one care at a time: the filter matches current_role()
+      exactly, so neither a role hierarchy nor secondary roles combine them.
+
+      The narrow family is only emitted where it differs from the company-wide
+      one: for a company with two or more locations IN THAT CARE. Where a company
+      has one location in a care, ANALYTICS__<CARE>_<NN>_READER already is that
+      location.
+
+      ONE TABLE PER ACCOUNT, in ANALYTICS_INTERMEDIATE.CARE_MANAGEMENT. Not the
+      report schema: readers are granted SELECT there, and this table must stay
+      unreadable to them — only the filter reads it, in owner context. Not the
+      mart care_management schema either, which the Power BI refresh user reads;
+      nothing outside dbt has a reason to see it.
+
+      BUILT IN PHASE 1, BY EVERY CARE'S RUN, although it is account-wide. It is an
+      ancestor of that care's raw_access views, so the CI selection
+      `+path:models/staging +path:models/access` builds it ahead of them — and it
+      has to exist by then, because Snowflake refuses to create a view over a
+      table that does not exist. Every run builds it from every care's raw
+      `location` (union_cares over ANALYTICS_RAW), so the N rebuilds of one deploy
+      produce the same table, each one an atomic CREATE OR REPLACE: no window in
+      which the map is empty and every customer-facing view returns zero rows.
+
+      The per-care copies that used to live in ANALYTICS_RAW_ACCESS.<care>.
+      META_CUSTOMER_ROLE_MAP are no longer read by anything. dbt does not drop
+      them; drop them by hand.
+
+      Every test below guards the same failure mode: nothing here raises when it
+      is wrong, it just makes the filter match nothing, and the customer sees an
+      empty report with no error anywhere.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [role_name, location_id]
+    columns:
+      - name: role_name
+        description: >
+          Reader role the row grants to, matched against current_role() exactly —
+          upper-case, as Snowflake stores an unquoted role name. The roles
+          themselves are created and granted by hand in Snowflake, outside this
+          repo, so a row whose role does not exist is simply inert.
+
+          DELIBERATELY NOT UNIQUE, for the company-wide family and the company
+          groups: one role per (source, company) or per group, one row per location,
+          so a company with four locations in a care repeats its role on four rows —
+          that repetition IS the grant.
+          A unique test here fails on any care holding a multi-location company,
+          and "fixing" it by de-duplicating to one row per role would drop every
+          location but one out of the filter and empty that customer's report.
+          The narrow family is unique by construction, but do not test it as such
+          — the column holds both.
+        tests:
+          - not_null
+      - name: source
+        description: >
+          The source schema the location lives in (care1 ... care5, beta, alpha, alpha2) —
+          the same token as the `source` column of every relation from intermediate
+          up, and the prefix inside role_name. customer_access_filter matches it
+          against the filtered row's `source`, so a role only ever reaches its own
+          care's rows even where the (company, location) pair exists in another.
+        tests:
+          - not_null
+      - name: company_id
+        description: location.companyid — the customer. Allocated globally, so the
+          same id is the same company in every care; the role is per care
+          regardless.
+        tests:
+          - not_null
+      - name: location_id
+        description: >
+          location.id within its care. A location produces one row per role it
+          belongs to — the company-wide one, the location one where its company has
+          several locations in that care, and one per company group that lists its
+          company — so the grain is (role_name, location_id), pinned
+          by the model-level test. Unique WITHIN a care only; across cares the ids
+          collide, which is what the `source` column is for.
+        tests:
+          - not_null
+      - name: is_active
+        description: >
+          False for a soft-deleted location (`deleted` set). A lifecycle marker
+          only — customer_access_filter does NOT read it, and its header says why.
+          Nothing in the project reads it today.
+      - name: is_company_wide
+        description: >
+          True on the company-wide family's rows (ANALYTICS__CARE1_02_READER) and the
+          company groups' (ANALYTICS__CARE2_120_124_READER), false on the location
+          family's (ANALYTICS__CARE1_02_L35_READER). customer_access_filter reads it
+          only for a row with no location, which it shows to those company-level
+          roles alone — its header says why.
+        tests:
+          - not_null

@@ -1,0 +1,46 @@
+name: mart__bridge_client_tag
+schema: care_management
+description: "One row per client of mart__all_clients_report and each of their live tags. The Tags slicer of the All Clients report."
+grain: "One row per source + client_id + tag_id"
+modelRole: factless-fact
+rationale:
+  purpose: "Legacy matches a client holding ANY selected tag; a slicer on tag_name through this bridge gives exactly that, and counts a client holding two of them once."
+  design: "Power BI - bridge[client_key] *:1 all_clients[client_key] with cross-filter BOTH, slicer on tag_name filtered to is_client_tag = TRUE (the tags the legacy filter offers). Restricted to the report's clients, so every row finds its client; the RLS keys are the client's."
+columns:
+  - name: source
+    dataType: "VARCHAR"
+    description: "Tenant token of the source schema the row came from. Opens the grain."
+    isNaturalKey: true
+  - name: client_id
+    dataType: "NUMBER(38,0)"
+    description: "Client key. Grain with source + tag_id. Power BI relates on client_key."
+    isNaturalKey: true
+  - name: client_key
+    dataType: "NUMBER(38,0)"
+    description: "Relationship key to mart__all_clients_report — source_key(source, client_id)."
+    isForeignKey: true
+  - name: tag_id
+    dataType: "NUMBER(38,0)"
+    description: "Tag key (tag.id). Grain with source + client_id."
+    isNaturalKey: true
+  - name: tag_key
+    dataType: "NUMBER(38,0)"
+    description: "source_key(source, tag_id), for a tag dimension should one be added."
+  - name: tag_name
+    dataType: "VARCHAR"
+    description: "Tag label (tag.tag) — the slicer value."
+  - name: tag_color
+    dataType: "VARCHAR"
+    description: "Tag colour (tag.color)."
+  - name: tag_category_id
+    dataType: "NUMBER(38,0)"
+    description: "Tag category (tag.tagCategoryId), the order of the comma-joined Tags column. Not a Sort by column for tag_name: one name can carry two categories across the companies of a model."
+  - name: is_client_tag
+    dataType: "BOOLEAN"
+    description: "True for a client-side tag (tag.clientSide = 1); the legacy filter offers only these."
+  - name: company_id
+    dataType: "NUMBER(38,0)"
+    description: "Company key, from the client. RLS key (with location_id)."
+  - name: location_id
+    dataType: "NUMBER(38,0)"
+    description: "Location key, from the client. RLS key (with company_id)."

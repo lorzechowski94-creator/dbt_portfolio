@@ -1,0 +1,2483 @@
+version: 2
+
+# EVERY MART BELOW IS ACCOUNT-WIDE AND OPENS ITS GRAIN WITH `source`.
+# The marts are built once per account, over intermediates that are account-wide
+# too: models/intermediate/ reads every care's staging relations at once and
+# stamps each row with the care it came from (models/intermediate/_int__models.yml
+# has the why, macros/union_cares.sql the mechanics). A handful of marts have no
+# intermediate under them and do that union themselves, straight from staging.
+# client ids, carer ids, job type ids, group ids and location ids are all
+# allocated PER CARE — separate MySQL databases — so the same id is a different
+# thing in another care.
+#
+# Two consequences that nothing in dbt enforces for you:
+#   * Every join between two relations that carry `source` needs
+#     `and a.source = b.source`. Forgetting it does not error — it fans each row out
+#     against the other cares' matching ids and silently multiplies every measure.
+#   * Every Power BI relationship needs source + the id, not the id alone.
+#
+# The `unique_combination` test on each model grain is what catches a missed join
+# condition (tests/generic/unique_combination.sql). It replaced the plain `unique`
+# tests on the bare id columns, which were true while each care had its own
+# relation and are false now.
+#
+# mart__dim_date is the exception: a generated calendar, identical for every care,
+# so it carries no `source` column and is simply built once.
+models:
+  - name: mart__client_hours_report
+    description: >
+      FACT — client hours per client per service date PER JOB TYPE, full history
+      plus a 60-day forward look (macros/report_horizon.sql). The single fact
+      behind BOTH client hours reports: Power BI filters
+      by date and aggregates to one row per client (Client Hours) or one row per
+      client × job type (Client Hours by Job Type). Leaving job type off a visual
+      sums the job type rows back to the exact client total, so there is no
+      client-level sibling fact. Thin additive numeric fact; demographics are in
+      mart__dim_client (relate on client_key), the JobType name in
+      mart__dim_jobtype (relate on job_type_key), group filtering via
+      mart__bridge_jobtype_group. Non-additive report figures (Non-Delivered
+      excl, A v S, Billable Schedule, Billable v Confirmed, Total Deliverable,
+      HH:MM) are DAX measures over these columns. Incremental (delete+insert on
+      service_date): each run replaces every date from 60 days back up to the
+      horizon; older backfills need --full-refresh.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [client_key, service_date, job_type_key]
+    columns:
+      - name: source
+        description: >
+          Tenant token of the source schema the row came from. Opens the grain, and
+          part of every relationship to a dimension.
+        tests:
+          - not_null
+      - name: client_key
+        description: >
+          Power BI relationship key to dim_client — source_key(source, client_id).
+          A Power BI relationship takes ONE column and client_id alone repeats
+          across cares, so relating on the bare id would join one care's client to
+          another's. Added by the fact so both sides of the relationship carry the
+          identical string.
+        tests:
+          - not_null
+      - name: job_type_key
+        description: >
+          Power BI relationship key to dim_jobtype — source_key(source, job_type_id).
+          Same reason as client_key. The NO_JOB_TYPE bucket yields source_key(source, -1),
+          which matches no dim_jobtype row, so it lands on the blank member exactly
+          as the bare -1 did.
+        tests:
+          - not_null
+      - name: service_date
+        description: Service date (logDate / occurrence date / recurrDate). Part of the grain; the Power BI date filter.
+        tests:
+          - not_null
+      - name: allocated_hrs
+        description: Contracted hours (cmAssignedHours) on the date for this job type.
+      - name: total_scheduled_hrs
+        description: Scheduled event hours minus unpaid breaks on the date for this job type.
+      - name: scheduled_unassigned_hrs
+        description: Scheduled hours with no assigned carer (carerId = 0, statusId = 1).
+      - name: scheduled_event_hrs_all
+        description: Raw scheduled event hours (no break deduction) — feeds the Total Scheduled HH:MM measure.
+      - name: non_delivered_incl_cancelled_hrs
+        description: >
+          statusChangeEventsRemoved eventMinutes / 60 on the date, split by job
+          type. Deviation from legacy, which ignored the source jobType column and
+          repeated one client-level total on every job type row.
+      - name: cancelled_timesheet_billed_hrs
+        description: Cancelled timesheet hours, billed (timeType='Cancelled', dontBill=0).
+      - name: cancelled_timesheet_not_billed_hrs
+        description: Cancelled timesheet hours, not billed (timeType='Cancelled', dontBill=1).
+      - name: confirmed_payable_hrs
+        description: Confirmed payable timesheet hours (all types) — feeds Total Confirmed + its HH:MM measure.
+      - name: total_confirmed_billed_hrs
+        description: confirmed_payable minus not-billed cancellations.
+      - name: total_actual_time_hrs
+        description: Physical clock duration where timeType IS NULL.
+      - name: schedule_difference_hrs
+        description: Allocated minus Total Confirmed (Billed).
+      - name: breaks_paid_scheduled_hrs
+        description: Paid scheduled break hours for assigned events.
+      - name: breaks_unpaid_scheduled_hrs
+        description: Unpaid scheduled break hours for assigned events.
+      - name: breaks_paid_scheduled_unassigned_hrs
+        description: Paid scheduled break hours for unassigned events.
+      - name: breaks_unpaid_scheduled_unassigned_hrs
+        description: Unpaid scheduled break hours for unassigned events.
+      - name: breaks_paid_confirmed_hrs
+        description: Paid confirmed break hours (timesheet.tea, teaPay = 1).
+      - name: breaks_unpaid_confirmed_hrs
+        description: Unpaid confirmed break hours (timesheet.tea, teaPay <> 1).
+
+  - name: mart__dim_jobtype
+    description: >
+      DIMENSION — one row per job type (id -> name). Provides the JobType column
+      and slicer for mart__client_hours_report and mart__carer_hours_report;
+      relate on job_type_key.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, job_type_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests:
+          - not_null
+      - name: job_type_id
+        description: >
+          Job type primary key (jobtype.id). Grain of the dimension WITH source —
+          the id is allocated per care and repeats across them.
+        tests:
+          - not_null
+      - name: job_type_key
+        description: >
+          Power BI relationship key — source_key(source, job_type_id). The "one" side
+          of every relationship into this dimension. A Power BI relationship takes
+          ONE column and refuses a duplicate value on that side, so the bare
+          job_type_id cannot serve: it repeats across cares. The unique test here
+          is the guard — it fails in CI instead of at dataset load.
+        tests:
+          - unique
+          - not_null
+      - name: job_type_name
+        description: Job type display name (jobtype.name).
+      - name: company_id
+        description: Company key (jobtype.companyId). RLS key (with location_id).
+      - name: location_id
+        description: Location key (jobtype.locationId). RLS key (with company_id).
+
+  - name: mart__dim_jobtype_group
+    description: >
+      DIMENSION — one row per job type GROUP (jobtypeGroupName). The Power BI
+      slicer table for filtering the jobtype-grained reports by group instead of
+      by individual job type: put group_name on the slicer and let
+      mart__bridge_jobtype_group expand it into raw job type ids.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, group_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests:
+          - not_null
+      - name: group_id
+        description: >
+          Group primary key (jobtypeGroupName.id). Grain of the dimension WITH
+          care — the id is allocated per care and repeats across them.
+        tests:
+          - not_null
+      - name: group_key
+        description: >
+          Power BI relationship key — source_key(source, group_id). The "one" side of
+          the relationship to mart__bridge_jobtype_group. A Power BI relationship
+          takes ONE column and refuses a duplicate value on that side, so the bare
+          group_id cannot serve: it repeats across cares. The unique test here is
+          the guard — it fails in CI instead of at dataset load.
+        tests:
+          - unique
+          - not_null
+      - name: group_name
+        description: Group display name (jobtypeGroupName.name) — the slicer value.
+      - name: company_id
+        description: Company key (jobtypeGroupName.companyId). RLS key (with location_id).
+      - name: location_id
+        description: Location key (jobtypeGroupName.locationId). RLS key (with company_id).
+
+  - name: mart__bridge_jobtype_group
+    description: >
+      BRIDGE — one row per (group, job type) pair, exploded from the
+      comma-separated jobtypeGroupName.jobTypeList with SPLIT_TO_TABLE. Resolves
+      the group -> raw-ids many-to-many so a group slicer can filter facts that
+      only carry job_type_id. Power BI: dim_jobtype_group[group_key] 1:* bridge,
+      bridge[job_type_key] *:1 dim_jobtype[job_type_key] with cross-filter BOTH;
+      hide every bridge column (job_type_id is the very same raw id as on the
+      fact — a join key, not a slicer value). Ids absent from dim_jobtype
+      (deleted job types, stale list entries) are dropped. The fact's NO_JOB_TYPE
+      (-1) row belongs to no group, so a group selection excludes it — see the
+      DAX note in the model.
+
+      The `relationships` tests below run on the *_key columns, so they check the
+      care as well as the id — a single-column test on the bare id could not, and
+      would pass on a pair that exists only in ANOTHER care.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, group_id, job_type_id]
+    columns:
+      - name: source
+        description: >
+          Tenant token of the source schema the row came from, carried from the
+          group. Opens the grain and both Power BI relationships.
+        tests:
+          - not_null
+      - name: group_id
+        description: Group key. Grain with source + job_type_id. Power BI relates on group_key.
+        tests:
+          - not_null
+      - name: job_type_id
+        description: >
+          Job type key — one exploded jobTypeList token. Grain with source +
+          group_id. Power BI relates on job_type_key.
+        tests:
+          - not_null
+      - name: group_key
+        description: >
+          Power BI relationship key to dim_jobtype_group — source_key(source,
+          group_id). The "many" side of that relationship.
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('mart__dim_jobtype_group')
+                field: group_key
+      - name: job_type_key
+        description: >
+          Power BI relationship key to dim_jobtype — source_key(source, job_type_id).
+          The bridge's side of the *:1 relationship into the job type dimension.
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('mart__dim_jobtype')
+                field: job_type_key
+      - name: company_id
+        description: Company key carried from the group. RLS key (with location_id).
+      - name: location_id
+        description: Location key carried from the group. RLS key (with company_id).
+
+  - name: mart__schedule_difference_report
+    description: >
+      FACT/DETAIL — Schedule Difference Report, one row per individual scheduled
+      call occurrence, comparing the scheduled template against the matched
+      timesheet (early/late, worked vs scheduled, timesheet status, cancellation
+      info). Full history plus a 60-day forward look (macros/report_horizon.sql);
+      a future call has no timesheet yet, so its timesheet status is 'None'.
+      Incremental (delete+insert on occurrence_date): each run replaces every date
+      from 60 days back up to the horizon. Power BI filters by date and job type.
+      company_id/location_id carried for the report secure view. Ports
+      scheduleReport_diff.php. Display names are NOT on the row — relate
+      client_key/carer_key/job_type_key/occurrence_date to dim_client / dim_carer /
+      dim_jobtype / dim_date; at ~100M rows each denormalised name was the bulk of
+      the table. Power BI setup, the display format for time_diff_minutes and the
+      legacy-fidelity notes are in docs/powerbi_schedule_difference_measures.md.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, recurr_id, occurrence_date]
+    columns:
+      - name: source
+        description: >
+          Tenant token of the source schema the row came from. Opens the grain, and
+          part of every relationship except dim_date.
+        tests:
+          - not_null
+      - name: recurr_id
+        description: Source recurr id. Part of the grain (source + recurr_id + occurrence_date).
+        tests:
+          - not_null
+      - name: occurrence_date
+        description: The individual expanded call date. Part of the grain; the Power BI date filter.
+        tests:
+          - not_null
+      - name: status_id
+        description: recurr.statusId (1 = active, 2 = cancelled).
+      - name: occurrence_key
+        description: >
+          Row key — the grain packed into one integer:
+          source_code * 10^15 + recurr_id * 10^5 + days since 1900-01-01. The "one"
+          side for mart__search_index, which needs a single unique column and this
+          fact has none: its grain is source + recurr_id + occurrence_date.
+          source_code comes from source_codes() in macros/source_topology.sql, a permanent
+          number per tenant. The parts cannot collide while recurr_id stays below
+          10^10 and the date before 2173 (10^5 days), and the largest key fits
+          Power BI's int64 for up to 9,222 cares; the unique test would catch a
+          breach. Type it int64 in Power BI all the same: a double is exact only
+          below 2^53, which holds just while care codes stay at 8 or less. An INTEGER, not the 'care1|123|20260805' string it replaced,
+          because a key that differs on every row costs a string dictionary entry
+          per row in Power BI. As text it was the biggest column of the Schedule
+          Difference model, in this fact and again in the index.
+        tests:
+          - not_null
+          - unique
+      - name: client_key
+        description: >
+          Power BI relationship key to dim_client — source_key(source, client_id). The
+          relationships test runs here rather than on the bare id, so it checks the
+          care as well: a client_id that exists only in another care would pass the
+          single-column test and still be the wrong person.
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('mart__dim_client')
+                field: client_key
+      - name: carer_key
+        description: >
+          Power BI relationship key to dim_carer — source_key(source, carer_id). The
+          relationships test is a WARNING, not an error: this fact admits carers by
+          state (1/2/3) while dim_carer requires permissionId = 4 and deleted IS
+          NULL, so a deleted carer's calls have no dimension row and lose their name
+          in the report. If the warning fires, widen dim_carer (keep + mark, as
+          dim_hrfile does) rather than dropping the rows.
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('mart__dim_carer')
+                field: carer_key
+              config:
+                severity: warn
+      - name: job_type_key
+        description: >
+          Power BI relationship key to dim_jobtype — source_key(source, job_type_id).
+          The -1 bucket yields source_key(source, -1), which matches no dimension row, so
+          the test excludes it; it also warns rather than errors because
+          dim_jobtype filters deleted job types out.
+
+          The exclusion reads the KEY, not the bare id: that column no longer exists
+          on the fact. source_key(source, -1) is source_code * 10^12 - 1, so key + 1 is a
+          multiple of 10^12 exactly when the id is -1, in any care.
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('mart__dim_jobtype')
+                field: job_type_key
+              config:
+                severity: warn
+                where: "mod(job_type_key + 1, 1000000000000) <> 0"
+      - name: schedule_start
+        description: Scheduled start time "HH:MM".
+      - name: schedule_finish
+        description: Scheduled finish time "HH:MM" ('00:00' -> '24:00').
+      - name: clocked_in
+        description: Actual clock-in "HH:MM"; empty if no timesheet or still clocked in.
+      - name: clocked_out
+        description: Actual clock-out "HH:MM"; empty if no timesheet or status='In'.
+      - name: early_late_minutes
+        description: >
+          Actual logIn - scheduled start in minutes (+ late, - early); NULL if no
+          timesheet. Numeric twin of early_late — sorts numerically and feeds the
+          On Time % / Avg Early-Late measures.
+      - name: early_late
+        description: >
+          Early / Late as the legacy report displays it: 'On time' / '+15' / '- 10';
+          NULL if no timesheet. Put this on the table visual, early_late_minutes in
+          the measures.
+      - name: scheduled_time
+        description: Scheduled event duration "HH:MM".
+      - name: worked_time
+        description: Actual worked duration "HH:MM"; empty if no timesheet or status='In'.
+      - name: time_diff_minutes
+        description: Worked - scheduled duration in minutes (+ over, - under); NULL if no timesheet.
+      - name: cancellation_reason
+        description: Cancellation reason; only when status_id = 2.
+      - name: cancellation_comment
+        description: Cancellation comment; only when status_id = 2.
+      - name: timesheet_status
+        description: Confirmed / Submitted / None.
+      - name: system_comments
+        description: timesheet.comment (admin-generated note when present).
+      - name: company_id
+        description: Company key. RLS key (with location_id).
+      - name: location_id
+        description: Location key. RLS key (with company_id).
+
+  - name: mart__carer_qualification_report
+    description: >
+      FACT/DETAIL — Carer Qualification Export, one row per carer × qualification
+      record (a carer with N qualifications shows N rows; a carer with none shows
+      one row with null qualification columns). Flat detail report — all display
+      columns denormalised; company_id/location_id carried for the report secure
+      view. Direct-join report (no date expansion) so it is a full table rebuild.
+      Ports carerQualificationExport.php. The HR File filter is served by
+      mart__dim_hrfile — relate on hr_file_key and slice on hr_file_name.
+      Also the single fact behind the HR compliance dashboard: the same rows carry
+      expire_status / is_expiring / is_renewal / days_to_expiry, so every KPI tile
+      and its drill-down table read one grain. That dashboard counts active/pending
+      carers only — a report-side filter on state_id, because the export itself
+      must keep every carer.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [carer_key, qualification_record_id]
+    columns:
+      - name: source
+        description: >
+          Tenant token of the source schema the row came from. Opens the grain and
+          part of every relationship to a dimension.
+        tests:
+          - not_null
+      - name: carer_key
+        description: >
+          Power BI relationship key to dim_carer — source_key(source, carer_id). This
+          export denormalises the carer columns it displays, so the relationship is
+          OPTIONAL; the key is here so every fact in the account offers the same
+          one, not because this report needs it.
+        tests:
+          - not_null
+      - name: hr_file_key
+        description: >
+          Power BI relationship key to dim_hrfile — source_key(source,
+          qualification_type_id). The HR File slicer relates on this rather than the
+          bare id, which repeats across cares. source_key(source, -1) (carer holds no
+          qualification record) matches no dimension row and lands on the blank
+          member, exactly as the bare -1 did.
+        tests:
+          - not_null
+      - name: qualification_key
+        description: >
+          Row key — source_key(source, qualification_record_id). The "one" side for
+          mart__search_index, which needs a single unique column to relate to and
+          this fact has none: its grain is source + carer_id + qualification record.
+          The record id alone is enough because a qualification record belongs to
+          one carer. A carer holding no qualification has a NULL record id, so that
+          row takes the NEGATED carer key, -source_key(source, carer_id): still one row
+          per carer, and never equal to a record's key, which is positive.
+        tests:
+          - not_null
+          - unique
+      - name: carer_no
+        description: Front-end carer display id (carer.carerId).
+      - name: qualification_record_id
+        description: >
+          Qualification record key (cmQualifications.id); null on the row a carer
+          with no qualifications produces. Count HR FILES with
+          DISTINCTCOUNT on this column — COUNTROWS would also count those
+          carer-with-no-file rows.
+      - name: qualification_name
+        description: Qualification type name; render in red when is_type_deleted is true.
+      - name: is_type_deleted
+        description: >
+          True when the company has retired this HR file type; false while in use.
+          Boolean, never null. Rows for retired types are kept deliberately (audit
+          lookback) — mark them, do not filter them out.
+      - name: awarded
+        description: Award date; blank/null for missing or zero dates.
+      - name: expired
+        description: Expiry date; blank/null when the file has no expiry.
+      - name: expire_status
+        description: >
+          The file's status — 'not_actioned' (neither date filled) / 'expired'
+          (expireDate <= today, so a file expiring TODAY is expired) / 'valid'
+          (expires after today, or an award with no expiry). Mutually exclusive and
+          exhaustive; null where the carer holds no qualification record. Serves
+          both reports: the flat export searches it as a keyword, and the
+          compliance dashboard's valid/not-actioned/expired split on the category
+          tiles and the File Types table comes straight from it.
+      - name: days_to_expiry
+        description: >
+          Whole days from the build date to the expiry — 0 means it expires today
+          (already 'expired'), negative means overdue, null when there is no expiry.
+          Use -days_to_expiry for "Days Overdue" and days_to_expiry for "Days
+          Remaining". As-of the build date, so it is only right while the daily
+          refresh runs; a DAX DATEDIFF against TODAY() is the query-time
+          alternative if the model ever refreshes less often.
+      - name: is_expiring
+        description: >
+          Still valid, but inside its type's own alert window
+          (cmQualificationsType.alertBefore, a calendar interval such as '4 week' or
+          '1 month'). The window runs from the expiry date minus that interval to
+          the day before expiry — a file expiring today is expired, not expiring.
+          An OVERLAY on
+          expire_status = 'valid', NOT a fourth state — never add it to a
+          valid + expired total. False when the type has no alert window
+          configured.
+      - name: is_renewal
+        description: >
+          True when the record replaced an earlier file (cmQualifications.multiple
+          = 1). "Renewed last month" = this flag plus an awarded date inside the
+          window; pick the window in DAX (rolling 30 days or calendar month).
+      - name: state
+        description: Carer state name; state 3 shown as 'Archived'.
+      - name: state_id
+        description: >
+          Raw carer state code (1 active, 2 pending, 3 archived) behind that label.
+          The compliance dashboard's scope filter — state_id in (1, 2) — belongs on
+          the report, not in this mart.
+      - name: area_id
+        description: >
+          The carer's area id (carer.area as a number; null where the source holds
+          free text). Branch-level RLS key: the TenantArea role keeps rows whose area
+          belongs to one of the admin's allowed workgroups (see mart__area_scope).
+      - name: modified_by
+        description: Full name of the carer who last modified the qualification record.
+      - name: file_uploaded
+        description: '"Yes" if any file is attached (multiple-files table or legacy fileName), else "No".'
+      - name: comments
+        description: Free-text note on the qualification record.
+      - name: company_id
+        description: Company key. RLS key (with location_id).
+      - name: location_id
+        description: Location key. RLS key (with company_id).
+
+  - name: mart__dim_hrfile
+    description: >
+      DIMENSION — one row per HR file type (cmQualificationsType): name, category
+      and category label. Provides the "HR File" slicer for
+      mart__carer_qualification_report; relate on hr_file_key and put the
+      slicer on hr_file_name (one entry per name, even though the type table repeats
+      each name per company/location). Retired types are kept and MARKED via
+      is_deleted / retired_date, never filtered out: facts reference them, the export
+      shows them in red, and audit lookbacks reach years back to when the type was
+      still in use. Do not filter this dimension on is_deleted at page/report level
+      — that propagates to the fact and drops the history rows.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, qualification_type_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests:
+          - not_null
+      - name: qualification_type_id
+        description: >
+          Qualification type primary key (cmQualificationsType.id). Grain of the
+          dimension WITH source — the id is allocated per care and repeats.
+        tests:
+          - not_null
+      - name: hr_file_key
+        description: >
+          Power BI relationship key — source_key(source, qualification_type_id). The
+          "one" side of the relationship to mart__carer_qualification_report. A
+          Power BI relationship takes ONE column and refuses a duplicate value on
+          that side, so the bare id cannot serve: it repeats across cares. The
+          unique test here is the guard — it fails in CI instead of at dataset load.
+        tests:
+          - unique
+          - not_null
+      - name: hr_file_name
+        description: HR file / qualification display name (cmQualificationsType.name). The slicer column.
+      - name: category
+        description: Raw category value (1-5, 100, 101, null); 100/101 are the Private/Confidential access-controlled categories.
+      - name: hr_file_type
+        description: HR File Type category label mapped from category (report §4.3); '' when category is null or unknown.
+      - name: alert_before
+        description: >
+          Alert window of this type as typed in the app
+          (cmQualificationsType.alertBefore): a count and a unit, '4 week',
+          '1 month'; null when none is configured. For display — the fact's
+          is_expiring is already resolved against it, so do not re-derive the flag
+          in DAX.
+      - name: alert_before_value
+        description: >
+          The count in alert_before (4 in '4 week'). Null when there is no window,
+          and also when the text is not a count and a unit — the test
+          assert_alert_before_parsed warns on those (macros/alert_before.sql).
+      - name: alert_before_unit
+        description: The unit in alert_before, normalised to day / week / month / year; null alongside alert_before_value.
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['day', 'week', 'month', 'year']
+      - name: is_deleted
+        description: >
+          True when the type is retired from the company's HR file list
+          (cmQualificationsType.deleted is set); false while it is still in use.
+          Boolean, never null — the source column is a nullable timestamp. Use it as
+          a displayed column / conditional format, not as a report-level filter.
+      - name: retired_date
+        description: Date the type was retired (cmQualificationsType.deleted cast to date); null while in use. Audit trail.
+      - name: company_id
+        description: Company key (cmQualificationsType.companyId). RLS key (with location_id).
+      - name: location_id
+        description: Location key (cmQualificationsType.locationId). RLS key (with company_id).
+
+  - name: mart__dim_client
+    description: >
+      DIMENSION — one row per client with demographics, area/workgroup/branch,
+      funder / care manager, referral, status, billing, service commencement and
+      first scheduled event. Relate to the fact on client_key in Power BI.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, client_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests:
+          - not_null
+      - name: client_id
+        description: >
+          Client primary key. Grain of the dimension WITH source — the id is
+          allocated per care and repeats across them.
+        tests:
+          - not_null
+      - name: client_key
+        description: >
+          Power BI relationship key — source_key(source, client_id). The "one" side of
+          every relationship into this dimension. A Power BI relationship takes ONE
+          column and refuses a duplicate value on that side, so the bare client_id
+          cannot serve: it repeats across cares. The unique test here is the guard
+          — it fails in CI instead of at dataset load.
+        tests:
+          - unique
+          - not_null
+      - name: client_no
+        description: >
+          Front-end client display id (client.residentId). The continuity
+          report's "Social Services Ref" column — that label is this column, not
+          council_id.
+      - name: first_name
+        description: Client first name (client.fname).
+      - name: surname
+        description: Client surname (client.sname).
+      - name: full_name
+        description: First name + surname — the reports' Client Name column.
+      - name: area_id
+        description: >
+          Area id (client.area as a number; null where the source holds free text).
+          Branch-level RLS key: the TenantArea role keeps clients whose area belongs
+          to one of the admin's allowed workgroups (see mart__area_scope).
+      - name: area_name
+        description: Area name (area.name via client.area).
+      - name: address
+        description: Current address line 1 (client.currentAddress1).
+      - name: town
+        description: Current town (client.currentTown).
+      - name: county
+        description: Current county (client.currentCounty).
+      - name: post_code
+        description: Post code (client.postCode).
+      - name: phone
+        description: Home phone number (client.phoneHome).
+      - name: email
+        description: Email address (client.email).
+      - name: date_of_birth
+        description: Client date of birth (client.dob).
+      - name: service_commencement
+        description: Client induction date (client.inductionDate).
+      - name: first_scheduled_event
+        description: Earliest timesheet logDate ever for the client.
+      - name: cso
+        description: >
+          CSO. The same value as billing_code — both read
+          clientDetails.billingCode; the legacy reports show it under two names.
+      - name: workgroup
+        description: Comma-joined workgroup name(s) for the client's area.
+      - name: branch
+        description: Comma-joined branch name(s) for the client's area.
+      - name: coordinator_zone
+        description: Coordinator / Zone (client.hseCoordinator).
+      - name: billing_code
+        description: Billing code (clientDetails.billingCode). See cso — same source column.
+      - name: referral_reason
+        description: Referral reason name (referralReason lookup).
+      - name: unit_id
+        description: Unit key (client.currentUnit).
+      - name: council_id
+        description: >
+          Council id (client.councilId) — the "Council Id" column on the schedule
+          difference report. NOT the Social Services Ref; that is client_no.
+      - name: care_manager
+        description: Care Manager full name (contacts typeId = 10).
+      - name: funder
+        description: Funder full name (contacts typeId = 8).
+      - name: state_id
+        description: >
+          Client state id (1 = active, 2 = pending, 3 = inactive). Drives the
+          Total Deliverable fallback branch in the client hours DAX. NOT exposed
+          on the MCP semantic view — status_label is, because a code groups into
+          "1, 2, 3". The two must agree; both come from
+          int__client_information.
+      - name: status_label
+        description: >
+          Client state as text (the `type` of the status lookup), the readable
+          form of state_id. This is the client-status dimension on the MCP
+          semantic view, so the wording here is what a natural-language answer
+          groups by.
+      - name: company_id
+        description: Company key (client.companyId). RLS key (with location_id).
+      - name: location_id
+        description: Location key (client.location). RLS key (with company_id).
+
+  - name: mart__search_index
+    description: >
+      SEARCH INDEX — every searchable value in the account in long format, one row
+      per entity per attribute, backing the Power BI cross-column search box in all
+      reports. ONE table rather than one per entity because a text slicer filters
+      ONE column: every searchable value has to share a single value_text, and
+      schedule difference alone draws on dim_client, dim_carer, dim_jobtype and its
+      own fact. There is one key column per entity and exactly ONE is populated per
+      row; a report that searches one entity relates it 1:*, a report that
+      searches several relates none and its measure matches each key with TREATAS
+      and ORs the results (docs/powerbi_client_hours_measures.md#model). Which key an attribute gets is decided by the table the report's
+      field parameter names in NAMEOF(), not by where the value physically lives —
+      see the model header. Column lists are curated by cost: a dimension attribute
+      is one row per entity, a fact attribute one row per fact row, which is why
+      only the two sparse text columns of the 112M-row schedule difference fact are
+      indexed.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [client_key, carer_key, job_type_key, group_key, qualification_key, occurrence_key, column_ref]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from.
+        tests:
+          - not_null
+      - name: client_key
+        description: Relationship key into dim_client. Populated only on rows indexing a dim_client attribute.
+      - name: carer_key
+        description: Relationship key into dim_carer. Populated only on rows indexing a dim_carer attribute.
+      - name: job_type_key
+        description: Relationship key into dim_jobtype. Populated only on rows indexing a dim_jobtype attribute.
+      - name: group_key
+        description: >
+          Relationship key into dim_jobtype_group. Populated only on rows indexing
+          the group name, which the Client Hours Jobtype view groups by.
+      - name: qualification_key
+        description: >
+          Relationship key into mart__carer_qualification_report. Populated on rows
+          indexing that export's own columns — which sit on the fact because
+          dim_carer holds none of post_code / phone / email / state / branch /
+          workgroup — and ALSO on its HR File / HR File Type rows, whose values are
+          joined in from dim_hrfile. Those two could be keyed on hr_file_key in
+          principle, but the fact is already related to dim_hrfile for the HR File
+          slicer, so a second relationship from the index closes a loop and Power BI
+          refuses it. They keep column_ref = DIM_HRFILE[...] regardless, because
+          that is what the field parameter names.
+      - name: occurrence_key
+        description: >
+          Relationship key into mart__schedule_difference_report, copied from it.
+          Populated only on rows indexing its two sparse cancellation text columns.
+      - name: column_ref
+        description: >
+          JOIN KEY to a report's field parameter — the physical column reference
+          NAMEOF() stores in it, normalised to uppercase and without quotes around
+          the table name. Keyed on the physical name rather than the display label
+          so renaming a column in a report cannot silently drop it from search.
+        tests:
+          - not_null
+      - name: value_text
+        description: >
+          The attribute value as text, formatted the way the reports render it
+          (dates as DD-MM-YYYY). The column the text slicer searches with
+          "contains". Never null or empty — a blank would match every term, and
+          dropping blanks is also what keeps the schedule difference columns
+          affordable.
+        tests:
+          - not_null
+      - name: company_id
+        description: Company key, copied from the indexed entity. RLS key (with location_id).
+      - name: location_id
+        description: Location key, copied from the indexed entity. RLS key (with company_id).
+
+  - name: mart__carer_hours_report
+    description: >
+      FACT — carer hours per carer per service date PER JOB TYPE (full history
+      plus a 60-day forward look, macros/report_horizon.sql). Single fact ported
+      from carersHoursRpt.php serving both the
+      carer-level report (Power BI sums over all job_type_id) and the jobtype
+      slicer (filter job_type_id, relate to dim_jobtype on job_type_key).
+      Demographics live in mart__dim_carer (relate on carer_key). Scheduled/confirmed/worked
+      split by recurr.jobType / timesheet.jobType; contracted has no jobType so it
+      lands in a single NO_JOB_TYPE (-1) bucket per carer/date (keeps the fact
+      additive — summing all job types reconciles exactly to carer totals).
+      Incremental (delete+insert on service_date): each run replaces every date
+      from 60 days back up to the horizon; older backfills need --full-refresh.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [carer_key, service_date, job_type_key]
+    columns:
+      - name: source
+        description: >
+          Tenant token of the source schema the row came from. Opens the grain, and
+          part of every relationship to a dimension.
+        tests: [not_null]
+      - name: service_date
+        description: Service date (scheduled occurrence / timesheet logDate / contract day). Grain with carer_id + job_type_id.
+        tests: [not_null]
+      - name: carer_key
+        description: >
+          Power BI relationship key to dim_carer — source_key(source, carer_id). A
+          Power BI relationship takes ONE column and carer_id alone repeats across
+          cares, so relating on the bare id would join one care's carer to another's.
+        tests: [not_null]
+      - name: job_type_key
+        description: >
+          Power BI relationship key to dim_jobtype — source_key(source, job_type_id).
+          Same reason as carer_key. The NO_JOB_TYPE bucket yields source_key(source, -1),
+          which matches no dim_jobtype row, so it lands on the blank member exactly
+          as the bare -1 did.
+        tests: [not_null]
+      - name: scheduled_hrs
+        description: Scheduled hours from recurr occurrences (additive).
+      - name: confirmed_payable_hrs
+        description: Confirmed payable time (timesheet.time) in hours (additive).
+      - name: worked_hrs
+        description: Actual worked duration (timesheet.duration) in hours (additive).
+      - name: contracted_hrs
+        description: Contracted hours from cmContractsHours — only on the NO_JOB_TYPE (-1) row per carer/date (additive).
+      - name: over_under_contracted_hrs
+        description: contracted_hrs - confirmed_payable_hrs per row; DAX subtracts the summed pillars.
+      - name: phone_admin_total_count
+        description: Confirmed timesheets with dontPay IS NULL (phone-vs-admin denominator).
+      - name: carer_confirmed_count
+        description: Carer-confirmed subset (phone-vs-admin numerator).
+
+  - name: mart__dim_carer
+    description: >
+      DIMENSION — one row per carer with the demographic / display columns of the
+      carer hours report and the RLS keys (company_id/location_id) used by the
+      report secure view over the fact. Scope: permissionId = 4, deleted IS NULL.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, carer_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: carer_id
+        description: >
+          Carer primary key (carer.id). Grain of the model WITH source — the id is
+          allocated per care and repeats across them.
+        tests: [not_null]
+      - name: carer_key
+        description: >
+          Power BI relationship key — source_key(source, carer_id). The "one" side of
+          every relationship into this dimension. A Power BI relationship takes ONE
+          column and refuses a duplicate value on that side, so the bare carer_id
+          cannot serve: it repeats across cares. The unique test here is the guard
+          — it fails in CI instead of at dataset load.
+        tests:
+          - unique
+          - not_null
+      - name: carer_no
+        description: Front-end carer reference number (carer.carerId).
+      - name: surname
+        description: Carer surname (carer.sname).
+      - name: first_name
+        description: Carer first name (carer.fname).
+      - name: full_name
+        description: First name + surname.
+      - name: date_of_birth
+        description: Carer date of birth (carer.dob).
+      - name: start_date
+        description: Carer employment start date (carer.startDate).
+      - name: area_id
+        description: >
+          Area id (carer.area as a number; null where the source holds free text).
+          Branch-level RLS key: the TenantArea role keeps carers whose area belongs
+          to one of the admin's allowed workgroups (see mart__area_scope).
+      - name: area
+        description: Area name (area.name via carer.area).
+      - name: address
+        description: Carer address line 1 (carer.address1).
+      - name: town
+        description: Carer town (carer.town).
+      - name: county
+        description: Carer county (carer.county).
+      - name: position
+        description: Position/role name (cmEmployeePositions.name via carer.position).
+      - name: company_id
+        description: Company key (carer.companyId). RLS key (with location_id).
+      - name: location_id
+        description: Location key (carer.location). RLS key (with company_id).
+
+  - name: mart__dim_date
+    description: >
+      DIMENSION — the shared Power BI date table, one row per calendar date from
+      2000-01-01 through 31 Dec of the year the projection horizon (the end of the
+      third whole month from today, macros/projection_horizon.sql) falls in —
+      next year from 1 October, so the forward-looking facts, the furthest being
+      mart__workforce_capacity, always find their date here. Relate every dated fact to it
+      on its date column and mark it as the Date table in Power BI; all date
+      slicers filter this, never a fact. Scope is deliberately wider than any one
+      report needs (the continuity report uses only calendar_date and year) —
+      it is a shared calendar, so the attributes are defined here once rather than
+      denormalised per fact. Do not trim it to a single report's requirements. Runs to year END (not to the horizon) because
+      Power BI time intelligence needs complete years and the continuity report's
+      Year measures snap the selection out to whole calendar years — which is why
+      it does NOT reuse int__report_calendar, deliberately capped at the horizon
+      for recurrence expansion. Full table rebuild each run, so the range rolls
+      forward on its own. Carries no company_id/location_id: a calendar is not
+      customer data, so report__dim_date applies no row filter. No relative-date
+      flags — they would freeze at build time; compute those in DAX.
+    columns:
+      - name: calendar_date
+        description: The date. Grain of the dimension; the Power BI relationship key and Date-table column.
+        tests:
+          - unique
+          - not_null
+      - name: year
+        description: Calendar year. The column the continuity report's Year measures filter on via TREATAS.
+      - name: quarter_number
+        description: Calendar quarter 1-4.
+      - name: quarter_name
+        description: Quarter label ("Q3").
+      - name: month_number
+        description: Month 1-12. Sort column for month_name.
+      - name: month_name
+        description: Full month name ("August"). Set its sort column to month_number in Power BI.
+      - name: month_short
+        description: Three-letter month name ("Aug").
+      - name: year_month
+        description: Integer YYYYMM. Sort column for month_year_label.
+      - name: month_year_label
+        description: Month + year label ("Aug 2026"). Set its sort column to year_month.
+      - name: day_of_month
+        description: Day of month 1-31.
+      - name: day_of_year
+        description: Day of year 1-366.
+      - name: iso_week
+        description: ISO week number (weekiso, 1 = Monday). Pair with iso_year, never with year — see the model header.
+      - name: iso_year
+        description: ISO week-numbering year; differs from year around 1 January.
+      - name: iso_year_week
+        description: Integer YYYYWW. Sort column for iso_week_label.
+      - name: iso_week_label
+        description: ISO week label ("2026-W32"). Set its sort column to iso_year_week.
+      - name: day_of_week_number
+        description: ISO day of week (1 = Monday .. 7 = Sunday). Sort column for day_name.
+      - name: day_name
+        description: Full day name ("Monday"). Set its sort column to day_of_week_number.
+      - name: day_short
+        description: Three-letter day name ("Mon").
+      - name: is_weekend
+        description: True for Saturday and Sunday.
+      - name: start_of_month
+        description: First day of the date's month.
+      - name: end_of_month
+        description: Last day of the date's month.
+      - name: start_of_year
+        description: 1 January of the date's year.
+      - name: end_of_year
+        description: 31 December of the date's year.
+
+  - name: mart__continuity_report
+    description: >
+      FACT — Continuity of Care, one row per client per service date per carer,
+      full history / all dates. Ports continuityReport.php. Deliberately thin: the
+      report's headline metric is 1 - COUNT(DISTINCT carerId) / COUNT(id), which is
+      NOT additive and therefore cannot be stored against a date range at all — the
+      carer stays on the grain and Power BI takes DISTINCTCOUNT(carer_id) after the
+      date filter. The same fact serves BOTH halves of the report: the Period
+      columns read the current filter, the Year columns re-apply it snapped out to
+      whole calendar years, so the two can never desynchronise. Display columns
+      (Client Name, Social Services Ref, Area, Branch) live in mart__dim_client
+      (relate on client_key); carer names in mart__dim_carer (relate on carer_key).
+      No job type on the grain — the report covers all visit types equally. Every
+      displayed column is a DAX measure; see
+      docs/powerbi_continuity_report_measures.md for the definitions, the star
+      schema and the legacy-fidelity notes (including the open decision on whether
+      to keep legacy's per-client double-counting totals row). Incremental (merge)
+      on source + client_id + service_date + carer_id; rolling 60-day re-merge,
+      older backfills need --full-refresh.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [client_key, service_date, carer_key]
+    columns:
+      - name: source
+        description: >
+          Tenant token of the source schema the row came from. Opens the grain and
+          the incremental merge key, and part of every relationship to a dimension.
+        tests: [not_null]
+      - name: service_date
+        description: Service date (timesheet.logDate). Grain with client_id + carer_id; the Power BI date filter.
+        tests: [not_null]
+      - name: client_key
+        description: >
+          Power BI relationship key to dim_client — source_key(source, client_id). A
+          Power BI relationship takes ONE column and client_id alone repeats across
+          cares, so relating on the bare id would join one care's client to another's.
+        tests: [not_null]
+      - name: carer_key
+        description: >
+          Power BI relationship key to dim_carer — source_key(source, carer_id). Same
+          reason as client_key. The -1 sentinel yields source_key(source, -1), which
+          matches no dim_carer row and lands on the blank member, exactly as the
+          bare -1 did. DISTINCTCOUNT for the Carers measure stays on carer_id
+          within a care; use carer_key if a visual ever spans cares.
+        tests: [not_null]
+      - name: visit_count
+        description: >
+          COUNT of delivered timesheets (timeType IS NULL) for this
+          client/date/carer — the report's "Visits" figure and the denominator of
+          the continuity ratio. Additive and unrounded, so any date-range SUM is
+          exact.
+
+  - name: mart__birthday_report
+    description: >
+      FACT/DETAIL — Birthday Report. One row per person (client or carer) with a
+      usable date of birth; flat list, no aggregation and no totals row. Ports
+      birthday.php. The report's dateFrom/dateTo window is a Power BI filter over
+      next_birthday_date (or birthday_this_year for a backward-looking window),
+      not a column here, so unlike the source the window wraps across
+      31 December. Person type and state are slicers (person_type_label, state)
+      rather than the source's GET parameters. Date-relative columns
+      (days_to_go, age_years) are evaluated at build time; date_of_birth,
+      birth_month and birth_day are stable if a same-day figure is needed in DAX.
+      Column semantics are documented on int__birthday_people.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, person_key]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: person_key
+        description: >
+          Surrogate key, care, person type and id in one integer:
+          source_code * 10^13 + (1 client, 2 carer) * 10^12 + person_id. Unique on its
+          own; the layout is int__birthday_people's.
+        tests: [not_null, unique]
+      - name: person_type
+        description: "'client' or 'carer'."
+      - name: person_type_label
+        description: Display form of person_type — Client / Carer. The report's Type column.
+      - name: person_id
+        description: client.id or carer.id. Not unique on its own.
+        tests: [not_null]
+      - name: title
+        description: Salutation; often blank.
+      - name: first_name
+        description: First name (fname).
+      - name: surname
+        description: Surname (sname).
+      - name: full_name
+        description: The report's Name column — title + first name + surname.
+      - name: date_of_birth
+        description: Date of birth, bounded to 1900-01-01 .. build date.
+        tests: [not_null]
+      - name: birth_month
+        description: Month of birth (1-12).
+      - name: birth_day
+        description: Day of month of birth (1-31).
+      - name: birthday_this_year
+        description: Anniversary in the current calendar year; may be in the past.
+      - name: next_birthday_date
+        description: Next anniversary on or after the build date — the report's date filter.
+        tests: [not_null]
+      - name: days_to_go
+        description: The report's Days To Go value; 0 = today, never negative. Default sort, ascending.
+      - name: days_to_go_label
+        description: Display text for days_to_go.
+      - name: age_years
+        description: The report's Years Old column — age as at the build date, not at the upcoming birthday.
+      - name: age_at_next_birthday
+        description: Age reached on next_birthday_date.
+      - name: gender
+        description: The report's Gender column (sex), free text in the source.
+      - name: email
+        description: Email address; null when blank.
+      - name: area_id
+        description: >
+          The person's own area id (client.area or carer.area as a number; null where
+          the source holds free text). Branch-level RLS key: the TenantArea role keeps
+          rows whose area belongs to one of the admin's allowed workgroups (see
+          mart__area_scope).
+      - name: area_name
+        description: The report's Area column; falls back to the raw area id (client.area / carer.area) when unmapped.
+      - name: workgroup
+        description: Comma-joined workgroup names for the area.
+      - name: branch
+        description: Comma-joined branch names for the area.
+      - name: state_id
+        description: Raw state code — 1 Active, 2 Pending, 3 Archived.
+      - name: state
+        description: The report's State column — Active / Pending / Archived.
+      - name: company_id
+        description: Company key. RLS key (with location_id).
+        tests: [not_null]
+      - name: location_id
+        description: Location key. RLS key (with company_id).
+        tests: [not_null]
+
+  - name: mart__anniversary_report
+    description: >
+      FACT/DETAIL — Anniversary Report. One row per carer with a usable
+      employment start date; flat list, no aggregation and no totals row. Ports
+      anniversary.php. The report's dateFrom/dateTo window (today .. today + 7 by
+      default in the source) is a Power BI filter over next_anniversary_date (or
+      anniversary_this_year for a backward-looking window), not a column here, so
+      unlike the source the window wraps across 31 December. State is a slicer
+      rather than the source's GET parameter. Stands alone in Power BI, like
+      mart__birthday_report — carer_key would relate it to mart__dim_carer, but
+      the list needs nothing from it, and dim_carer drops deleted carers that
+      this report keeps. Date-relative columns (days_to_go, years_active,
+      years_at_next_anniversary) are evaluated at build time; start_date,
+      start_month and start_day are stable if a same-day figure is needed in DAX.
+      Column semantics are documented on int__carer_anniversaries.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, carer_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: carer_key
+        description: >
+          source_key(source, carer_id) — unique on its own, so the one column that
+          identifies a row across the account. Same value as mart__dim_carer's key
+          for the same carer.
+        tests:
+          - unique
+          - not_null
+      - name: carer_id
+        description: >
+          Carer primary key (carer.id). Grain WITH source — the id is allocated per
+          care and repeats across them.
+        tests: [not_null]
+      - name: title
+        description: Salutation; often blank.
+      - name: first_name
+        description: First name (fname).
+      - name: surname
+        description: Surname (sname).
+      - name: full_name
+        description: The report's Name column — title + first name + surname.
+      - name: start_date
+        description: The report's Start Date column (carer.startDate), bounded to 1900-01-01 .. build date.
+        tests: [not_null]
+      - name: start_month
+        description: Month of the start date (1-12).
+      - name: start_day
+        description: Day of month of the start date (1-31).
+      - name: anniversary_this_year
+        description: Anniversary in the current calendar year; may be in the past, null for a carer who started this year.
+      - name: next_anniversary_date
+        description: Next anniversary on or after the build date — the report's date filter. Never the start date itself.
+        tests: [not_null]
+      - name: days_to_go
+        description: The report's Days To Go value; 0 = today, never negative. Default sort, ascending.
+      - name: years_active
+        description: >
+          The report's Years Active column — completed years as at the build date,
+          not at the upcoming anniversary.
+      - name: years_at_next_anniversary
+        description: Which anniversary next_anniversary_date is (1 = first).
+      - name: gender
+        description: The report's Gender column (sex), free text in the source.
+      - name: email
+        description: The report's Email column; null when blank.
+      - name: area_id
+        description: >
+          The carer's area id (carer.area as a number; null where the source holds
+          free text). Branch-level RLS key: the TenantArea role keeps rows whose area
+          belongs to one of the admin's allowed workgroups (see mart__area_scope).
+      - name: area_name
+        description: The report's Area column; null when carer.area matches no area.
+      - name: workgroup
+        description: Comma-joined workgroup names for the area.
+      - name: branch
+        description: Comma-joined branch names for the area.
+      - name: state_id
+        description: Raw state code — 1 Active, 2 Pending, 3 Archived.
+      - name: state
+        description: The report's State column — Active / Pending / Archived.
+      - name: person_type_label
+        description: The report's Type column — always 'Carer'.
+      - name: company_id
+        description: Company key. RLS key (with location_id).
+        tests: [not_null]
+      - name: location_id
+        description: Location key. RLS key (with company_id).
+        tests: [not_null]
+
+  - name: mart__plans_taken_report
+    description: >
+      FACT/DETAIL — Plans Taken. One row per plan started for a client or a carer
+      (cmFormsPlansTaken), full history, both types; flat list, no aggregation and
+      no totals row. Ports plansTakenReport.php (All Plans Taken). The page's
+      inputs are slicers here: Type is person_type, and its From / To window
+      applies to started_date, review_date or completed_date as its Search choice
+      says, so relate all three to mart__dim_date (Started active, the other two
+      inactive, switched with USERELATIONSHIP). Only people that exist and are not
+      deleted are listed, and only care workers for carer plans (no admin
+      profiles), for every viewer: the page's restricted and unrestricted admins
+      see different rows. Column semantics and the row set are documented
+      on int__plans_taken. Full table rebuild each run.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, plan_taken_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: plan_taken_key
+        description: source_key(source, plan_taken_id) — unique on its own; keep it in the table visual so equal rows never merge.
+        tests: [unique, not_null]
+      - name: plan_taken_id
+        description: >
+          Plan taken primary key (cmFormsPlansTaken.id). Grain WITH source — the id
+          is allocated per care and repeats across them.
+        tests: [not_null]
+      - name: person_type
+        description: "'client' or 'carer' — the report's Type."
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['client', 'carer']
+      - name: person_type_label
+        description: Display form of person_type — Client / Carer. The Type slicer.
+      - name: person_id
+        description: client.id or carer.id, the person the plan is for. Not unique on its own.
+        tests: [not_null]
+      - name: person_key
+        description: >
+          The person in one integer (source_code * 10^13 + (1 client, 2 carer) *
+          10^12 + person_id), as on mart__birthday_report. Distinct count = people
+          with a plan.
+        tests: [not_null]
+      - name: first_name
+        description: First name (fname).
+      - name: surname
+        description: Surname (sname); the legacy name column sorts by it.
+      - name: full_name
+        description: The report's Client / Carer column — first name + surname.
+      - name: person_state_id
+        description: The person's state — 1 Active, 2 Pending, 3 Archived.
+      - name: person_state
+        description: The report's State — Active / Pending / Archived, also the colour of the name.
+      - name: area_id
+        description: >
+          The person's area id (client.area or carer.area as a number). Branch-level
+          RLS key: the TenantArea role keeps rows whose area belongs to one of the
+          admin's allowed workgroups (see mart__area_scope), and hides a row without
+          one under an area limit, as the page does.
+      - name: area_name
+        description: The report's Area column; null when the person has no area or no area row holds it.
+      - name: workgroup_names
+        description: >
+          The report's Work Group column — the area's live workgroups, comma-joined,
+          from the same mapping as All Carers and All Clients
+          (int__area_workgroup_branch). Display only.
+      - name: branch_names
+        description: The report's Branch column — the live branches of those workgroups, comma-joined. Display only.
+      - name: plan_id
+        description: Plan template id (cmFormsPlansTaken.planId).
+      - name: plan_template_name
+        description: Template name (cmPlans.name), the Plan slicer value; null when the template row is missing.
+      - name: plan_name
+        description: The report's Plan Name column — appendedPlanName when set, else the template name.
+      - name: started_at
+        description: The report's Started column (created), a timestamp.
+        tests: [not_null]
+      - name: started_date
+        description: started_at as a date. Active relationship to mart__dim_date.
+        tests: [not_null]
+      - name: started_by_id
+        description: createdBy, the user who started the plan.
+      - name: started_by
+        description: The report's Started By column — that user's name, when they are a carer row of the plan's company.
+      - name: completed_at
+        description: The report's Completed column (completed); null while pending.
+      - name: completed_date
+        description: completed_at as a date. Inactive relationship to mart__dim_date (Search = Completed Dates).
+      - name: is_completed
+        description: True once completed_at is set.
+      - name: completion_status
+        description: Completed / Pending — the text the report shows for a plan not completed yet.
+      - name: completed_by_id
+        description: completedBy.
+      - name: completed_by
+        description: The report's Completed By column, as for started_by.
+      - name: review_date
+        description: >
+          The report's Review Date column. Inactive relationship to mart__dim_date
+          (Search = Review Dates). Some dates lie past the end of the calendar
+          table (typed years up to 2925); a date filter drops those rows.
+      - name: next_plan_taken_id
+        description: The plan taken that followed this one at its review (nextPlan). Not on the legacy page.
+      - name: is_superseded
+        description: >
+          A newer, live version of this plan exists. Not on the legacy page; the
+          filter behind a "reviews due" figure (see int__plans_taken).
+      - name: is_signed_off
+        description: The report's Sign Off column — the plan carries at least one live signature.
+      - name: location_key
+        description: >
+          Relationship key to mart__dim_location — source_key(source, location_id).
+          A WARNING when it misses, as on mart__all_carers_report: one care5 plan on
+          R2 PROD points at a location with no row.
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('mart__dim_location')
+                field: location_key
+              config:
+                severity: warn
+      - name: company_id
+        description: Company key (cmFormsPlansTaken.companyId). RLS key (with location_id).
+        tests: [not_null]
+      - name: location_id
+        description: Location key (cmFormsPlansTaken.locationId). RLS key (with company_id).
+        tests: [not_null]
+
+  - name: mart__dim_location
+    description: >
+      DIMENSION — one row per location, the branch a carer, client or visit
+      belongs to. The Branch slicer of the Workforce Capacity report and the
+      tenant boundary of its two facts, which carry location_key on every row.
+      A Power BI RLS role that filters this table therefore reaches every row of
+      both facts. SHARED: nothing in it is specific to one report, so any fact
+      with a location can relate here. is_deleted is a lifecycle marker only.
+      A soft-deleted location still owns its history, and nothing may filter on
+      it for access (see macros/customer_access_filter.sql).
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, location_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: location_id
+        description: Location primary key (location.id). Grain WITH source — the id repeats across cares.
+        tests: [not_null]
+      - name: location_key
+        description: >
+          Power BI relationship key — source_key(source, location_id)
+          (macros/source_key.sql). The facts build the identical string.
+        tests: [unique, not_null]
+      - name: location_name
+        description: Location name (location.name) — the Branch slicer label.
+      - name: company_id
+        description: Company key (location.companyId). RLS key (with location_id); the facts take their company_id from here.
+      - name: address
+        description: First address line (location.address1).
+      - name: town
+        description: Town.
+      - name: county
+        description: County.
+      - name: post_code
+        description: Postcode.
+      - name: country
+        description: Country.
+      - name: created_date
+        description: Date the location was created.
+      - name: deleted_date
+        description: Date the location was soft-deleted; null while live.
+      - name: is_deleted
+        description: True once soft-deleted. Lifecycle marker only — never an access filter.
+
+  - name: mart__area_scope
+    description: >
+      BRIDGE — area <-> workgroup <-> branch, one row per link, ids only. The table
+      behind the TenantArea role of the embedded Power BI models
+      (docs/powerbi_embedded_setup.md). The care app can restrict an admin to some
+      branches or workgroups of a location (cmLevelAccess: a list of branch ids and
+      a list of workgroup ids). Every legacy report applies that restriction as
+      `area IN (...)`, because a client or carer reaches a branch only through their
+      area. The legacy area list (getAccessList() in menu.php) is the areas
+      of the admin's WORKGROUP list. The branch list is used only when no workgroup
+      was picked, and then it supplies the workgroups of those branches. The two
+      lists are never combined, neither as a union nor as an intersection.
+      The admin's area list is too long for an embed token: over 1,000 characters
+      for some admins. Their branch and workgroup ids fit in the token's
+      customData. So the token carries those ids, and the role uses this table to
+      apply the same rule and turn them into areas. It then matches those areas
+      against area_id on the table that carries the location rule. An area with no
+      workgroup link never reaches a restricted admin, although carers and clients
+      can still sit on it; the legacy list leaves it out the same way. Load it hidden
+      and with no relationships. It holds no names, so it needs no RLS rule of its
+      own. Same link filters as int__area_hierarchy and the legacy query: deleted
+      link rows are dropped, and the workgroup and branch rows themselves are not
+      checked. Moving a workgroup to another branch soft-deletes the old link, so
+      without that filter a moved workgroup would keep its old branch.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, area_id, workgroup_id, branch_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: company_id
+        description: Company key (cmLevelAreaWorkgroup.companyId). The role matches it with the token's company.
+      - name: location_id
+        description: Location key (cmLevelAreaWorkgroup.locationId).
+      - name: area_id
+        description: Area id (cmLevelAreaWorkgroup.areaId) — what the role hands to the area_id column of the report's tables.
+        tests: [not_null]
+      - name: workgroup_id
+        description: >
+          Workgroup id (cmLevelAreaWorkgroup.workgroupId) — matched against the token's
+          workgroup list. An area can sit in several workgroups, hence one row per link.
+        tests: [not_null]
+      - name: branch_id
+        description: >
+          Branch id (cmLevelWorkgroupBranch.branchId). A workgroup belongs to one
+          branch at most. Matched against the token's branch list, which counts only
+          when the workgroup list is empty. Null when the workgroup belongs to no
+          branch; such an area is reachable through a workgroup list only.
+
+  - name: mart__workforce_capacity
+    description: >
+      FACT — the hours of the Workforce Capacity report. Supply per carer per day
+      and demand per location per day, full history plus the three-month outlook,
+      up to the projection horizon (the end of the third whole month from today,
+      macros/projection_horizon.sql). The outlook is a direct projection of the
+      recurring roster rules, contracts and assigned hours as they stand at build
+      time, not a statistical forecast. GRAIN: source + location + area + carer +
+      date. Supply rows are one per carer at the carer's location and area
+      (contracted, available, scheduled). The demand columns (customer
+      contracted, unassigned, inactive-carer) sit on ONE row per location, client
+      area and date with carer_id = -1, the NO_JOB_TYPE device of
+      mart__carer_hours_report. It keeps every column additive, and a per-carer
+      measure that iterates carer_key finds 0 contracted and 0 scheduled on that
+      row. THE AREA exists for the embedded report's TenantArea role (a restricted
+      admin sees only the areas of their workgroups; option c, decided
+      2026-10-20). Summed over areas, every column gives the location total
+      unchanged. HOURS ARE ADDITIVE AND UNROUNDED:
+      "hrs / week", utilisation, unfilled capacity, headroom and estimated
+      additional customers are DAX measures (docs/powerbi_workforce_capacity_measures.md).
+      Unfilled capacity in particular clips contracted - scheduled at zero per
+      carer per ISO week, which no stored column can do for an arbitrary period.
+      The supply side is built on contracted hours; availability feeds only
+      available_hrs and nothing derived from it (the story's acceptance
+      criteria). Relate on location_key to dim_location (the tenant boundary),
+      on calendar_date to dim_date. carer_key relates to dim_carer for names
+      where needed, but dim_carer holds current carers only, so leavers' rows
+      land on its blank member. Service line (job type) is not split: contracted
+      and available hours carry no job type, so a job type filter would cut
+      demand but not supply. Incremental (delete+insert on calendar_date): each
+      run replaces every date from 60 days back up to the projection horizon.
+      Older backfills and new columns need --full-refresh.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [location_key, area_id, carer_key, calendar_date]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: calendar_date
+        description: The day. Relates to dim_date; past days are actuals, future days the outlook.
+        tests: [not_null]
+      - name: company_id
+        description: Company key, from the location (dim_location). RLS key (with location_id).
+      - name: location_id
+        description: >
+          Location key: the carer's for supply rows, the client's for the demand
+          row. RLS key (with company_id).
+        tests: [not_null]
+      - name: area_id
+        description: >
+          The area the hours belong to: the carer's on supply rows and on
+          scheduled_hrs, the client's on the demand row (customer contracted,
+          unassigned, inactive-carer). The person's CURRENT area, as the legacy area
+          filter reads it. The key the TenantArea role filters on; null where the
+          source holds the area as free text, which hides the row from a restricted
+          admin.
+      - name: location_key
+        description: Power BI relationship key to dim_location — source_key(source, location_id).
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('mart__dim_location')
+                field: location_key
+      - name: carer_key
+        description: >
+          source_key(source, carer_id); source_key(source, -1) (NO_CARER) on the location's
+          demand row. Iterate it for per-carer measures such as unfilled capacity.
+        tests: [not_null]
+      - name: contracted_hrs
+        description: >
+          Staff contracted hours (cmContractsHours history, one contract per day,
+          clipped to the employment spell) — the capacity baseline, and on future
+          dates the projected available hours of the outlook.
+      - name: available_hrs
+        description: >
+          Staff availability (cmCarerAvailability, overlapping windows merged,
+          at most 24 h per carer per day). Feeds only the Available Hours card and
+          chart line; 0 where a company records none.
+      - name: scheduled_hrs
+        description: >
+          Roster hours booked to an active care worker — the utilisation
+          numerator. Same figure as Carer Hours' Scheduled for that carer.
+      - name: unassigned_hrs
+        description: Roster hours booked to no one (carerId = 0). Demand row only.
+      - name: inactive_carer_hrs
+        description: >
+          Roster hours still booked to a carer who is not an active care worker on
+          the date — mostly live rules of carers who have left. Demand row only.
+      - name: customer_contracted_hrs
+        description: >
+          Customer contracted hours (cmAssignedHours, clipped to the client's
+          service spell) — the demand baseline. Demand row only.
+
+  - name: mart__workforce_movement
+    description: >
+      FACT — headcount and movement of the Workforce Capacity report, one row per
+      location, area and day, from each location area's first recorded start up
+      to today (history only). The area is the person's current one, there for
+      the TenantArea role as on mart__workforce_capacity. Behind the Staff & Customer Movement cards, the headcount
+      trend and the joiners-vs-leavers chart. Built from
+      int__carer_employment_spell and int__client_service_spell, whose
+      descriptions carry the joiner/leaver rules and the profiling behind them.
+      active_* are balances at the END of the day: a person counts from
+      start_date up to, not including, leave_date. They are SEMI-ADDITIVE, so
+      they sum across locations and areas but not across dates; a period shows its last
+      day's value (DAX LASTNONBLANK), never a SUM. *_joined / *_left are plain
+      additive counts. Active is a running sum of joins minus leaves, so
+      active(d) - active(d - 1) = joined(d) - left(d) on every row, and a
+      period's movement reconciles with its headcount. Starts before 2000-01-01,
+      where the calendar begins, open the balance on that day without counting
+      as joiners. Days with nobody active and no movement are left out. Full
+      table rebuild each run: the source only knows the CURRENT state, and a
+      reactivation clears the leave stamp, which rewrites that person's history.
+      Relate on location_key to dim_location and on calendar_date to dim_date.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [location_key, area_id, calendar_date]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: calendar_date
+        description: The day. Relates to dim_date.
+        tests: [not_null]
+      - name: company_id
+        description: Company key, from the location (dim_location). RLS key (with location_id).
+      - name: location_id
+        description: Location key (carer.location / client.location). RLS key (with company_id).
+        tests: [not_null]
+      - name: area_id
+        description: >
+          The person's current area (carer.area / client.area as a number), the key
+          the TenantArea role filters on. Staff and customers of one location area
+          share a row. Null where the source holds the area as free text, which is
+          a bucket of its own and hidden from a restricted admin.
+      - name: location_key
+        description: >
+          Power BI relationship key to dim_location — source_key(source, location_id).
+          The relationships test is a WARNING, not an error: carer.location and
+          client.location are not constrained in the source, and some point at a
+          location id the care's location table does not hold. Measured on R1 PROD
+          2026-09-30: 49,239 rows, all care4 carers of company 2, the vendor's demo
+          company, whose locations there are 1343-1380 while its carers carry ids
+          2-1292. R3 fails the same way (149,538 rows, not yet profiled). Such a row
+          has no company_id, so RLS already hides it from every reader; the warning
+          keeps the count visible instead of blocking the deploy.
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('mart__dim_location')
+                field: location_key
+              config:
+                severity: warn
+      - name: active_staff
+        description: Care workers in the workforce at the end of the day. Semi-additive (see the model description).
+      - name: staff_joined
+        description: Care workers whose start_date is this day.
+      - name: staff_left
+        description: Care workers whose leave_date is this day (moved out of Active — Archived or Pending).
+      - name: active_customers
+        description: Clients active at the end of the day. Semi-additive.
+      - name: customers_joined
+        description: Clients whose start_date is this day.
+      - name: customers_left
+        description: Clients whose leave_date is this day (moved out of Active — Archived or Pending).
+
+  - name: mart__all_carers_report
+    description: >
+      FACT/DETAIL — All Carers. One row per carer the legacy All Carers page lists
+      (Active, Pending and Archived care workers), whatever their area, workgroup
+      or branch; flat list, no dates, no totals.
+      Ports carersTotalAll.php / carerTblTotalAll.php. The page's tab is the state
+      slicer; its Branch and Workgroup filters work through
+      mart__bridge_carer_workgroup and its Tags filter through
+      mart__bridge_carer_tag, both related on carer_key. Location names come from
+      mart__dim_location on location_key. Also the base of all_carers_sv
+      (macros/create_semantic_views.sql). Stands apart from
+      mart__dim_carer, which holds current carers only (deleted IS NULL) and would
+      drop the Pending and Archived carers this list keeps. Column semantics, the
+      legacy quirks and the area handling are documented on int__all_carers.
+      Full table rebuild each run.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, carer_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: carer_key
+        description: >
+          source_key(source, carer_id) — unique on its own, the "one" side of the
+          relationships from mart__bridge_carer_tag and mart__bridge_carer_workgroup.
+          Same value as mart__dim_carer's key for the same carer.
+        tests: [unique, not_null]
+      - name: carer_id
+        description: >
+          Carer primary key (carer.id). Grain WITH source — the id is allocated per
+          care and repeats across them.
+        tests: [not_null]
+      - name: carer_no
+        description: The report's No. column — carerNum on the R3 servers, carerId elsewhere.
+      - name: has_private_note
+        description: Private-note warning icon in front of No. (carer.privateNote = 1).
+      - name: has_future_status_change
+        description: Future-status icon in front of No. — a status change still to run.
+      - name: first_name
+        description: First name (fname).
+      - name: surname
+        description: Surname (sname); the legacy Name column sorts by it.
+      - name: full_name
+        description: The report's Name column — first name + surname.
+      - name: gender
+        description: The report's Gender column (sex), free text in the source.
+      - name: address
+        description: The report's Address column — address line 1, town, county, post code, blanks skipped.
+      - name: address_line_1
+        description: Address line 1 (carer.address1); with town, what the Address search matches.
+      - name: town
+        description: Town.
+      - name: county
+        description: The report's County column.
+      - name: post_code
+        description: The report's Post Code column.
+      - name: area_id
+        description: >
+          The carer's area id (carer.area as a number); null when the carer has no
+          area. Branch-level RLS key: the TenantArea role keeps rows whose area
+          belongs to one of the admin's allowed workgroups (see mart__area_scope),
+          so a null is hidden under an area limit (decided 2026-10-27; the legacy
+          page shows those carers).
+      - name: area_name
+        description: The report's Area column; null when no area row holds that id.
+      - name: phone
+        description: The report's Phone column.
+      - name: phone2
+        description: Second phone; not displayed, but the Phone search matches it.
+      - name: email
+        description: The report's E-Mail column.
+      - name: tags
+        description: The report's Tags column, comma-joined in tag category order. Filter through mart__bridge_carer_tag.
+      - name: status_id
+        description: Status key (carer.statusId as a number).
+      - name: status
+        description: The report's Status column (status.type).
+      - name: status_colour
+        description: >
+          Status colour (status.colour), a Bootstrap 3 context class (info, danger,
+          primary, success, warning), not a colour code. Map it before using it for
+          conditional formatting.
+      - name: status_change_date
+        description: The report's Status Change column — dateChange of the latest status change.
+      - name: status_comment
+        description: The report's Comment column — the note of the latest status change.
+      - name: transport_type_id
+        description: Raw transport type code.
+      - name: transport_type
+        description: The report's Transport Type column — Driving / Walking / Cycle / Bus / public / Motorcycle.
+      - name: known_as
+        description: The report's Known As column; headed "Agent Ref" for company 164.
+      - name: pay_cycle
+        description: The report's Pay Cycle column — Weekly payroll / Monthly payroll.
+      - name: is_pay_cycle_loaded
+        description: >
+          False for a source whose cmCarerBank is not ingested yet; its null
+          pay_cycle then means "not loaded". Hide Pay Cycle where it is false.
+      - name: nationality
+        description: The report's Nationality column, each word capitalised.
+      - name: state_id
+        description: Raw state code — 1 Active, 2 Pending, 3 Archived.
+      - name: state
+        description: The report's state — Active / Pending / Archived (the legacy tabs).
+      - name: location_key
+        description: >
+          Relationship key to mart__dim_location — source_key(source, location_id).
+          A WARNING when it misses, as on mart__workforce_movement: carer.location
+          is not constrained in the source, and such a carer just has no location
+          name.
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('mart__dim_location')
+                field: location_key
+              config:
+                severity: warn
+      - name: company_id
+        description: Company key (carer.companyId). RLS key (with location_id).
+      - name: location_id
+        description: Location key (carer.location). RLS key (with company_id).
+
+  - name: mart__bridge_carer_tag
+    description: >
+      BRIDGE — one row per carer of mart__all_carers_report and each of their live
+      tags. The Tags slicer: legacy matches a carer holding ANY selected tag, which
+      is what a slicer on tag_name gives through this bridge. Power BI: relate
+      bridge[carer_key] *:1 all_carers[carer_key] with cross-filter BOTH, slice on
+      tag_name, and filter the slicer to is_carer_tag = TRUE, the tags the legacy
+      filter offers. Restricted to the report's carers, so every row finds its
+      carer; the RLS keys are the carer's.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, carer_id, tag_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: carer_id
+        description: Carer key. Grain with source + tag_id. Power BI relates on carer_key.
+        tests: [not_null]
+      - name: carer_key
+        description: Relationship key to mart__all_carers_report — source_key(source, carer_id).
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('mart__all_carers_report')
+                field: carer_key
+      - name: tag_id
+        description: Tag key (tag.id). Grain with source + carer_id.
+        tests: [not_null]
+      - name: tag_key
+        description: source_key(source, tag_id), for a tag dimension should one be added.
+        tests: [not_null]
+      - name: tag_name
+        description: Tag label (tag.tag) — the slicer value.
+      - name: tag_color
+        description: Tag colour (tag.color).
+      - name: tag_category_id
+        description: >
+          Tag category (tag.tagCategoryId), the order of the comma-joined Tags column.
+          Not a Sort by column for tag_name: one name can carry two categories across
+          the companies of a model.
+      - name: is_carer_tag
+        description: True for a carer-side tag (tag.carerSide = 1); the legacy filter offers only these.
+      - name: company_id
+        description: Company key, from the carer. RLS key (with location_id).
+      - name: location_id
+        description: Location key, from the carer. RLS key (with company_id).
+
+  - name: mart__bridge_carer_workgroup
+    description: >
+      BRIDGE — one row per carer of mart__all_carers_report and each live
+      workgroup of their area, with the workgroup's live branch where it has one
+      (int__area_workgroup_branch). An area can sit in several workgroups, so a
+      carer can have several rows, and this is a bridge, not a column. Power BI:
+      relate bridge[carer_key] *:1 all_carers[carer_key] with cross-filter BOTH
+      and slice on branch_name and workgroup_name, as for the tag bridge; leave
+      the blank branch out of the Branch slicer. A carer matches a workgroup when
+      their area sits in it, and a branch when their area sits in one of its
+      workgroups. Same rule as mart__bridge_client_workgroup (decided 2026-10-27):
+      a workgroup with no live branch is kept, with a blank branch, although the
+      carer page's Workgroup filter offers only the workgroups of the picked
+      branches. A carer whose area is in no live workgroup (or who has no area)
+      has no row, so any Branch or Workgroup pick hides them. CARER GRAIN ON
+      PURPOSE, not area grain: the carer table's RLS (TenantArea included) then
+      flows down this relationship, so a restricted admin's slicers list only
+      their own branches, and all_carers_sv can count carers per branch on it,
+      which a semantic view cannot do through an area-grain bridge.
+      mart__area_scope keeps the links as ids for the TenantArea role and also
+      keeps links this bridge drops (deleted workgroups or branches); it must not
+      be swapped for this table.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, carer_id, workgroup_id, branch_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: carer_id
+        description: Carer key. Grain with source + workgroup_id + branch_id. Power BI relates on carer_key.
+        tests: [not_null]
+      - name: carer_key
+        description: Relationship key to mart__all_carers_report — source_key(source, carer_id).
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('mart__all_carers_report')
+                field: carer_key
+      - name: workgroup_id
+        description: Workgroup id (cmLevelAreaWorkgroup.workgroupId).
+        tests: [not_null]
+      - name: workgroup_name
+        description: Workgroup name (cmLevelWorkgroup.name) — the Workgroup slicer value.
+      - name: branch_id
+        description: Branch id (cmLevelWorkgroupBranch.branchId); null for a workgroup with no live branch.
+      - name: branch_name
+        description: Branch name (cmLevelBranch.name) — the Branch slicer value; null with branch_id. Not the location.
+      - name: company_id
+        description: Company key, from the carer. RLS key (with location_id).
+      - name: location_id
+        description: Location key, from the carer. RLS key (with company_id).
+
+  - name: mart__all_clients_report
+    description: >
+      FACT/DETAIL — All Clients. One row per client the legacy All Clients page
+      lists (Active, Pending and Archived clients), whatever their area, workgroup
+      or branch, as on the page; flat list, no dates, no totals.
+      Ports clientsTotalAll.php / clientsTotalAllTableBc.php. The page's tab is the
+      state slicer; its Branch and Workgroup filters work through
+      mart__bridge_client_workgroup, its Tags filter through mart__bridge_client_tag
+      and its Job Type search through mart__bridge_client_job_type, all related on
+      client_key. Location names come from mart__dim_location on location_key.
+      Also the base of all_clients_sv (macros/create_semantic_views.sql). Stands
+      apart from mart__dim_client, which keeps every client of the client table
+      (no state rule) for the hours facts. Column semantics, the legacy quirks and
+      the area handling are documented on int__all_clients.
+      Full table rebuild each run.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, client_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: client_key
+        description: >
+          source_key(source, client_id) — unique on its own, the "one" side of the
+          relationships from the three client bridges. Same value as
+          mart__dim_client's key for the same client.
+        tests: [unique, not_null]
+      - name: client_id
+        description: >
+          Client primary key (client.id). Grain WITH source — the id is allocated
+          per care and repeats across them.
+        tests: [not_null]
+      - name: client_no
+        description: The report's No. column (residentId).
+      - name: has_private_note
+        description: Private-note warning icon in front of No. (client.privateNote = 1).
+      - name: has_future_status_change
+        description: Future-status icon in front of No. — a status change still to run.
+      - name: first_name
+        description: First name (fname).
+      - name: surname
+        description: Surname (sname); the legacy Name column sorts by it.
+      - name: full_name
+        description: The report's Name column — first name + surname.
+      - name: gender
+        description: The report's Gender column — Female / Male (F / M, 2 / 1, or the word), null for any other code.
+      - name: address
+        description: The report's Address column — address line 1, town, county, post code, blanks skipped.
+      - name: address_line_1
+        description: Address line 1 (client.currentAddress1); with town, what the Address search matches.
+      - name: town
+        description: Town (client.currentTown).
+      - name: county
+        description: The report's County column.
+      - name: post_code
+        description: The report's Post Code column.
+      - name: is_location_confirmed
+        description: False when the client has no latitude — the "Location not confirmed" marker.
+      - name: branch_names
+        description: The report's Branch column, comma-joined; null when the area reaches no live branch. Filter through mart__bridge_client_workgroup.
+      - name: workgroup_names
+        description: The report's Workgroup column, comma-joined, workgroups with no branch included; null when none. Filter through mart__bridge_client_workgroup.
+      - name: area_id
+        description: >
+          The client's area id (client.area as a number); null when the client has
+          no area. Branch-level RLS key: the TenantArea role keeps rows whose area
+          belongs to one of the admin's allowed workgroups (see mart__area_scope),
+          so a null is hidden under an area limit, as on the page.
+      - name: area_name
+        description: The report's Area column; null when no area row holds that id.
+      - name: email
+        description: The report's E-mail column.
+      - name: phone
+        description: The report's Phone column — home and mobile, blanks skipped.
+      - name: phone_home
+        description: Home phone; with phone_mobile, what the Phone search matches.
+      - name: phone_mobile
+        description: Mobile phone.
+      - name: date_of_birth
+        description: The report's DOB column.
+      - name: job_types
+        description: The report's Job Type column, comma-joined in the client's list order, deleted job types included. Filter through mart__bridge_client_job_type (live ones only).
+      - name: tags
+        description: The report's Tags column, comma-joined in tag category order. Filter through mart__bridge_client_tag.
+      - name: status_id
+        description: Status key (client.statusId as a number).
+      - name: status
+        description: The report's Status column (status.type).
+      - name: status_colour
+        description: >
+          Status colour (status.colour), a Bootstrap 3 context class (info, danger,
+          primary, success, warning), not a colour code. Map it before using it for
+          conditional formatting.
+      - name: status_change_at
+        description: >
+          The report's Status Change column — when the latest status change was
+          recorded, as TIMESTAMP_NTZ (the value as loaded, without a time zone).
+      - name: status_comment
+        description: The report's Comment column — the note of the latest status change.
+      - name: first_contact_date
+        description: The report's first contact column (admissionDate); the legacy header is the company's own label.
+      - name: service_commenced_date
+        description: The report's service commenced column (inductionDate); the legacy header is the company's own label.
+      - name: council_id
+        description: The report's Council Id column.
+      - name: state_id
+        description: Raw state code — 1 Active, 2 Pending, 3 Archived.
+      - name: state
+        description: The report's state — Active / Pending / Archived (the legacy tabs).
+      - name: location_key
+        description: >
+          Relationship key to mart__dim_location — source_key(source, location_id).
+          A WARNING when it misses, as on mart__all_carers_report: client.location
+          is not constrained in the source, and such a client just has no location
+          name.
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('mart__dim_location')
+                field: location_key
+              config:
+                severity: warn
+      - name: company_id
+        description: Company key (client.companyId). RLS key (with location_id).
+      - name: location_id
+        description: Location key (client.location). RLS key (with company_id).
+
+  - name: mart__bridge_client_tag
+    description: >
+      BRIDGE — one row per client of mart__all_clients_report and each of their
+      live tags. The Tags slicer: legacy matches a client holding ANY selected tag,
+      which is what a slicer on tag_name gives through this bridge, and a client
+      holding two of them is still one client (legacy lists them twice). Power BI:
+      relate bridge[client_key] *:1 all_clients[client_key] with cross-filter
+      BOTH, slice on tag_name, and filter the slicer to is_client_tag = TRUE, the
+      tags the legacy filter offers. Restricted to the report's clients, so every
+      row finds its client; the RLS keys are the client's.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, client_id, tag_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: client_id
+        description: Client key. Grain with source + tag_id. Power BI relates on client_key.
+        tests: [not_null]
+      - name: client_key
+        description: Relationship key to mart__all_clients_report — source_key(source, client_id).
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('mart__all_clients_report')
+                field: client_key
+      - name: tag_id
+        description: Tag key (tag.id). Grain with source + client_id.
+        tests: [not_null]
+      - name: tag_key
+        description: source_key(source, tag_id), for a tag dimension should one be added.
+        tests: [not_null]
+      - name: tag_name
+        description: Tag label (tag.tag) — the slicer value.
+      - name: tag_color
+        description: Tag colour (tag.color).
+      - name: tag_category_id
+        description: >
+          Tag category (tag.tagCategoryId), the order of the comma-joined Tags column.
+          Not a Sort by column for tag_name: one name can carry two categories across
+          the companies of a model.
+      - name: is_client_tag
+        description: True for a client-side tag (tag.clientSide = 1); the legacy filter offers only these.
+      - name: company_id
+        description: Company key, from the client. RLS key (with location_id).
+      - name: location_id
+        description: Location key, from the client. RLS key (with company_id).
+
+  - name: mart__bridge_client_workgroup
+    description: >
+      BRIDGE — one row per client of mart__all_clients_report and each live
+      workgroup of their area, with the workgroup's live branch where it has one
+      (int__area_workgroup_branch). An area can sit in several workgroups, so a
+      client can have several rows, and this is a bridge, not a column. Power BI:
+      relate bridge[client_key] *:1 all_clients[client_key] with cross-filter BOTH
+      and slice on branch_name and workgroup_name, as for the tag bridge; leave
+      the blank branch out of the Branch slicer. A client matches a workgroup when
+      their area sits in it, and a branch when their area sits in one of its
+      workgroups, as the page's filters match. A client whose area is in no live
+      workgroup (or who has no area) has no row, so any Branch or Workgroup pick
+      hides them, as on the page. CLIENT GRAIN ON PURPOSE, as
+      mart__bridge_carer_workgroup: the client table's RLS (TenantArea included)
+      then flows down this relationship, so a restricted admin's slicers list only
+      their own branches, and all_clients_sv can count clients per branch on it.
+      mart__area_scope keeps the links as ids for the TenantArea role and also
+      keeps links this bridge drops (deleted workgroups or branches); it must not
+      be swapped for this table.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, client_id, workgroup_id, branch_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: client_id
+        description: Client key. Grain with source + workgroup_id + branch_id. Power BI relates on client_key.
+        tests: [not_null]
+      - name: client_key
+        description: Relationship key to mart__all_clients_report — source_key(source, client_id).
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('mart__all_clients_report')
+                field: client_key
+      - name: workgroup_id
+        description: Workgroup id (cmLevelAreaWorkgroup.workgroupId).
+        tests: [not_null]
+      - name: workgroup_name
+        description: Workgroup name (cmLevelWorkgroup.name) — the Workgroup slicer value.
+      - name: branch_id
+        description: Branch id (cmLevelWorkgroupBranch.branchId); null for a workgroup with no live branch.
+      - name: branch_name
+        description: Branch name (cmLevelBranch.name) — the Branch slicer value; null with branch_id. Not the location.
+      - name: company_id
+        description: Company key, from the client. RLS key (with location_id).
+      - name: location_id
+        description: Location key, from the client. RLS key (with company_id).
+
+  - name: mart__bridge_client_job_type
+    description: >
+      BRIDGE — one row per client of mart__all_clients_report and each live job
+      type in their client.jobTypes list (int__client_job_types). The Job Type
+      slicer: legacy matches a client holding ANY matching job type, which is what
+      a slicer on job_type_name gives through this bridge, without the legacy
+      substring match on the ids. Deleted job types are left out, as the page's
+      search offers only live ones; the Job Type column on the client row still
+      names them. Power BI: relate bridge[client_key] *:1 all_clients[client_key]
+      with cross-filter BOTH and slice on job_type_name. Not related to
+      mart__dim_jobtype: the name is on the row, as the tag name is on the tag
+      bridge. Restricted to the report's clients, so every row finds its client;
+      the RLS keys are the client's.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, client_id, job_type_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: client_id
+        description: Client key. Grain with source + job_type_id. Power BI relates on client_key.
+        tests: [not_null]
+      - name: client_key
+        description: Relationship key to mart__all_clients_report — source_key(source, client_id).
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('mart__all_clients_report')
+                field: client_key
+      - name: job_type_id
+        description: Job type key (jobtype.id). Grain with source + client_id.
+        tests: [not_null]
+      - name: job_type_key
+        description: source_key(source, job_type_id) — the same value as mart__dim_jobtype's key.
+        tests: [not_null]
+      - name: job_type_name
+        description: Job type name (jobtype.name) — the slicer value.
+      - name: company_id
+        description: Company key, from the client. RLS key (with location_id).
+      - name: location_id
+        description: Location key, from the client. RLS key (with company_id).
+
+  - name: mart__assessments_report
+    description: >
+      FACT/DETAIL — Assessments. One row per live assessment of a client
+      (assessment), full history; flat list, no aggregation and no totals row.
+      The Assessments tab of Plan & Assessment Dates (plansAssesmentRpt.php),
+      whose Plans tab is mart__plans_taken_report and whose Wound / Skin tab is
+      mart__skin_assessments_report. The page's From / To window applies to
+      next_assessment_date, so relate that to mart__dim_date; its Status is
+      client_state. Listed as on the page, not de-duplicated: is_latest_of_type
+      marks the client's newest assessment of each type. Column semantics and the
+      row set are documented on int__assessments. Full table rebuild each run.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, assessment_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: assessment_key
+        description: source_key(source, assessment_id) — unique on its own; keep it in the table visual so equal rows never merge.
+        tests: [unique, not_null]
+      - name: assessment_id
+        description: >
+          Assessment primary key (assessment.id). Grain WITH source — the id is
+          allocated per care and repeats across them.
+        tests: [not_null]
+      - name: assessment_type_id
+        description: Assessment type id (assessment.assessmentId).
+        tests: [not_null]
+      - name: assessment_type_name
+        description: The report's Assessment Name column — the type's current name, the Assessment slicer value.
+      - name: is_assessment_type_deleted
+        description: The type is deleted. Its assessments are listed anyway, as on the legacy page.
+      - name: assessment_name
+        description: The name the assessment was saved with (assessment.name). Not on the legacy page.
+      - name: client_id
+        description: client.id, the client assessed. Not unique on its own.
+        tests: [not_null]
+      - name: client_key
+        description: source_key(source, client_id) — the same value as mart__dim_client's key.
+        tests: [not_null]
+      - name: first_name
+        description: First name (fname).
+      - name: surname
+        description: Surname (sname).
+      - name: full_name
+        description: The report's Client column — first name + surname.
+      - name: client_state_id
+        description: The client's state — 1 Active, 2 Pending, 3 Archived.
+      - name: client_state
+        description: The report's Status — Active / Pending / Archived, also the colour of the name.
+      - name: area_id
+        description: >
+          The client's area id (client.area as a number). Branch-level RLS key: the
+          TenantArea role keeps rows whose area belongs to one of the admin's
+          allowed workgroups (see mart__area_scope), and hides a row without one
+          under an area limit, as the page does.
+      - name: area_name
+        description: The report's Area column; null when the client has no area or no area row holds it.
+      - name: workgroup_names
+        description: >
+          The report's Work Group column — the area's live workgroups, comma-joined,
+          from the same mapping as Plans Taken (int__area_workgroup_branch). Display
+          only.
+      - name: branch_names
+        description: The report's Branch column — the live branches of those workgroups, comma-joined. Display only.
+      - name: assessment_date
+        description: The report's Assessment Date column — the date the assessment was done.
+      - name: next_assessment_date
+        description: >
+          The report's Next Assessment Date column, when the next one is due.
+          Relationship to mart__dim_date: the page's window. Some dates lie past
+          the end of the calendar table (typed years up to 2064); a date filter
+          drops those rows.
+      - name: note
+        description: The report's Note column.
+      - name: is_latest_of_type
+        description: >
+          The client's newest assessment of this type. Not on the legacy page; the
+          filter behind a "still due" figure (see int__assessments).
+      - name: location_key
+        description: >
+          Relationship key to mart__dim_location — source_key(source, location_id).
+          A WARNING when it misses, as on mart__plans_taken_report: 6 care2
+          assessments on R2 PROD point at a location with no row.
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('mart__dim_location')
+                field: location_key
+              config:
+                severity: warn
+      - name: company_id
+        description: Company key (assessment.companyId). RLS key (with location_id).
+        tests: [not_null]
+      - name: location_id
+        description: Location key (assessment.locationId). RLS key (with company_id).
+        tests: [not_null]
+
+  - name: mart__skin_assessments_report
+    description: >
+      FACT/DETAIL — Skin Assessments. One row per live entry of a client's wound
+      record (cmSkinAssessments): a wound's first assessment or one of its
+      reviews. The Wound / Skin tab of Plan & Assessment Dates. The page lists a
+      wound when any of its entries has a review date in the window, shows it by
+      its latest entry and drops it when that entry is healed: so relate
+      review_date to mart__dim_date, show the wound_* columns with wound_key, and
+      filter is_wound_healed = false. is_latest_entry = true leaves one row per
+      wound. Only sources whose cmSkinAssessments is ingested have rows (see
+      int__skin_assessments, which also documents the columns and the row set).
+      Full table rebuild each run.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, skin_assessment_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: skin_assessment_key
+        description: source_key(source, skin_assessment_id) — unique on its own.
+        tests: [unique, not_null]
+      - name: skin_assessment_id
+        description: >
+          Entry primary key (cmSkinAssessments.id). Grain WITH source — the id is
+          allocated per care and repeats across them.
+        tests: [not_null]
+      - name: wound_key
+        description: >
+          source_key(source, wound_id) — the wound. Keep it in the table visual so
+          two wounds with the same visible values never merge; distinct count =
+          wounds.
+        tests: [not_null]
+      - name: wound_id
+        description: The wound's first entry id (parentId, or the entry's own id on a first entry).
+        tests: [not_null]
+      - name: is_latest_entry
+        description: The wound's latest live entry, the one the page shows. One per wound.
+      - name: client_id
+        description: client.id, the client the wound is on. Not unique on its own.
+        tests: [not_null]
+      - name: client_key
+        description: source_key(source, client_id) — the same value as mart__dim_client's key.
+        tests: [not_null]
+      - name: first_name
+        description: First name (fname).
+      - name: surname
+        description: Surname (sname).
+      - name: full_name
+        description: The report's Client column — first name + surname.
+      - name: client_state_id
+        description: The client's state — 1 Active, 2 Pending, 3 Archived.
+      - name: client_state
+        description: The report's Status — Active / Pending / Archived, also the colour of the name.
+      - name: area_id
+        description: >
+          The client's area id. Branch-level RLS key for the TenantArea role (see
+          mart__area_scope); a row without one is hidden under an area limit.
+      - name: area_name
+        description: The client's area name. Not on the legacy tab.
+      - name: workgroup_names
+        description: The area's live workgroups, comma-joined. Display only; not on the legacy tab.
+      - name: branch_names
+        description: The live branches of those workgroups, comma-joined. Display only; not on the legacy tab.
+      - name: assessment_name
+        description: The entry's name.
+      - name: assessment_date
+        description: The entry's date.
+      - name: review_date
+        description: >
+          The entry's review date. Relationship to mart__dim_date: the page's
+          window, on any entry of the wound. Some dates lie outside the calendar
+          table (typed years from 1016 to 3026); a date filter drops those rows.
+      - name: is_healed
+        description: The entry is marked healed.
+      - name: wound_name
+        description: The report's Assessment Name column — the name of the wound's latest entry.
+      - name: wound_assessment_date
+        description: The report's Assessment Date column — the date of the wound's latest entry.
+      - name: wound_review_date
+        description: >
+          The report's Next Assessment Date column — the review date of the wound's
+          latest entry, which can lie outside the window that listed the wound.
+      - name: is_wound_healed
+        description: The wound's latest entry is healed; the page drops the wound.
+      - name: location_key
+        description: >
+          Relationship key to mart__dim_location — source_key(source, location_id).
+          A WARNING when it misses, as on mart__assessments_report.
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('mart__dim_location')
+                field: location_key
+              config:
+                severity: warn
+      - name: company_id
+        description: Company key (cmSkinAssessments.companyId). RLS key (with location_id).
+        tests: [not_null]
+      - name: location_id
+        description: >
+          Location key (cmSkinAssessments.locationId, else the client's location).
+          RLS key (with company_id).
+        tests: [not_null]
+
+  - name: mart__task_review_report
+    description: >
+      FACT/DETAIL — Task Review. One row per scheduled task slot per day per result
+      recorded on it, full history plus a 60-day forward look
+      (macros/report_horizon.sql): a slot with nothing recorded is one blank row, a
+      slot with several results one row each, as on the legacy Digital Task Review
+      page (companyTaskRpt.php). A future slot is a forecast of the schedule at
+      build time. No totals on the page. Count slots on is_latest_for_slot, which
+      marks one row per slot. Which schedules, dates and results make a row, and
+      where it departs from the page, is documented on int__task_review. Names are
+      on the row only where they belong to the result (status, sub status, who
+      recorded it): relate client_key to mart__dim_client, task_schedule_key to
+      mart__dim_task_schedule and scheduled_date to mart__dim_date. Incremental
+      (delete+insert on scheduled_date): each run replaces every date from 60 days
+      back up to the horizon, so a forecast slot whose schedule has since changed
+      does not survive. Power BI setup: docs/powerbi_task_review_setup.md.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, task_assign_id, task_assign_times_id, scheduled_date, result_number]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: scheduled_date
+        description: The date the slot is due — the page's Date. Part of the grain; relate to mart__dim_date.
+        tests: [not_null]
+      - name: task_assign_id
+        description: The schedule (cmdailyTasksAssign.id). Part of the grain WITH source.
+        tests: [not_null]
+      - name: task_schedule_key
+        description: Power BI relationship key to mart__dim_task_schedule — source_key(source, task_assign_id).
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('mart__dim_task_schedule')
+                field: task_schedule_key
+      - name: task_assign_times_id
+        description: The slot's time (cmdailyTasksAssignTimes.id); null for an "Any" slot. Part of the grain.
+      - name: assigned_time
+        description: The page's Assigned Time — "HH:MM", or 'Any'. Never the time period name (timePeriods is not loaded).
+      - name: assigned_time_minutes
+        description: Sort key for assigned_time — minutes after midnight, -1 for 'Any'.
+      - name: time_period_id
+        description: cmdailyTasksAssignTimes.timePeriodId; no name for it until timePeriods is loaded.
+      - name: result_id
+        description: The result (cmdailyTasksResults.id); null on the blank row of a slot with nothing recorded.
+      - name: result_number
+        description: 1, 2, ... in the order the slot's results were created; null on a blank row. Part of the grain.
+      - name: is_latest_for_slot
+        description: >
+          True on exactly one row per slot: its most recent result, or its blank
+          row. Every slot count and every "outcome of the slot" figure filters on it.
+        tests: [not_null]
+      - name: is_recorded
+        description: True when the row carries a result; false only on the blank row of a slot with nothing recorded.
+        tests: [not_null]
+      - name: status_id
+        description: >
+          cmdailyTasksResults.taskDone: 1 Completed, 2 Other, 3 Partially Completed,
+          4 Not Completed, 5 Missed, 6 Due, 7 Cancelled (the global statuses, DEV
+          care1). 5 and 6 are written by the app, not by a carer.
+      - name: status_name
+        description: >
+          The page's Status — the status name, or the company's own live name for it
+          in the location. Null for a result whose status no category holds.
+      - name: sub_status_id
+        description: cmdailyTasksResults.subTaskDone.
+      - name: sub_status_name
+        description: The page's Sub Status (cmdailyTasksReason.name).
+      - name: recorded_by_id
+        description: cmdailyTasksResults.createdBy.
+      - name: recorded_by
+        description: >
+          The page's Carer column — the name of carer row createdBy, office users and
+          deleted carers included, which is why it is on the row and not a key to
+          mart__dim_carer (care workers who are not deleted only). Null when no
+          carer row has that id.
+      - name: time_recorded
+        description: The page's Time Recorded (timeSaid), "HH:MM:SS".
+      - name: comment
+        description: The page's Comment.
+      - name: result_created_at
+        description: The page's Result Created (cmdailyTasksResults.created).
+      - name: client_id
+        description: The schedule's client (cmdailyTasksAssign.clientId).
+        tests: [not_null]
+      - name: client_key
+        description: >
+          Power BI relationship key to mart__dim_client — source_key(source,
+          client_id). The Client column and the Area / Work Group / Branch columns
+          come from there.
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('mart__dim_client')
+                field: client_key
+      - name: area_id
+        description: >
+          The client's area (client.area as a number). Branch-level RLS key: the
+          TenantArea role keeps rows whose area belongs to one of the admin's
+          allowed workgroups (see mart__area_scope), and hides a row without one
+          under an area limit. The page itself limits no rows by area.
+      - name: location_key
+        description: >
+          Relationship key to mart__dim_location — source_key(source, location_id).
+          A WARNING when it misses, as on mart__plans_taken_report.
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('mart__dim_location')
+                field: location_key
+              config:
+                severity: warn
+      - name: company_id
+        description: The schedule's company (cmdailyTasksAssign.companyId). RLS key (with location_id).
+        tests: [not_null]
+      - name: location_id
+        description: The schedule's location (cmdailyTasksAssign.locationId), the one the page lists. RLS key (with company_id).
+        tests: [not_null]
+
+  - name: mart__dim_task_schedule
+    description: >
+      DIMENSION — one row per task schedule (cmdailyTasksAssign): the task it is
+      for (cmdailyTasks) and how it is scheduled. Relate to
+      mart__task_review_report on task_schedule_key; it holds the Task slicer and
+      the page's Task column. The same schedules int__task_review expands: live,
+      with a company, a location and a task row, of a client that is not deleted.
+      Schedule grain rather than task grain, so that the fact needs one key and the
+      schedule's own pattern and dates sit next to the task name.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, task_assign_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: task_assign_id
+        description: cmdailyTasksAssign.id. Grain WITH source — the id is allocated per care.
+        tests: [not_null]
+      - name: task_schedule_key
+        description: source_key(source, task_assign_id) — the relationship key.
+        tests: [unique, not_null]
+      - name: client_id
+        description: The client the schedule is for (cmdailyTasksAssign.clientId).
+      - name: client_key
+        description: source_key(source, client_id).
+      - name: task_id
+        description: cmdailyTasksAssign.cmdailyTasksId, the task type.
+      - name: task_name
+        description: The page's Task column (cmdailyTasks.name).
+      - name: is_task_deleted
+        description: >
+          The task type is deleted (cmdailyTasks.deleted). Its schedules still show,
+          as on the page.
+      - name: is_mandatory
+        description: cmdailyTasksAssign.mandatory = 1, as stored. Not on the page.
+      - name: schedule_pattern
+        description: >
+          How the schedule repeats, as text: Once, Weekly: Mon, Wed ..., Every N
+          weeks: ..., Daily, or Every N days. Not on the page.
+      - name: date_start
+        description: cmdailyTasksAssign.dateStart.
+      - name: date_finish
+        description: cmdailyTasksAssign.dateFinish; null for an open-ended schedule.
+      - name: stopped_at
+        description: cmdailyTasksAssign.stoppedDate. Informational — it ends no slots, as on the page.
+      - name: stop_reason
+        description: cmdailyTasksAssign.reasonStop.
+      - name: location_key
+        description: source_key(source, location_id).
+      - name: company_id
+        description: The schedule's company. RLS key (with location_id).
+        tests: [not_null]
+      - name: location_id
+        description: The schedule's location. RLS key (with company_id).
+        tests: [not_null]

@@ -1,0 +1,43 @@
+name: mart__bridge_carer_workgroup
+schema: care_management
+description: "One row per carer of mart__all_carers_report and each live workgroup of their area, with the workgroup's live branch where it has one (int__area_workgroup_branch). The Branch and Workgroup slicers of the All Carers report."
+grain: "One row per source + carer_id + workgroup_id + branch_id"
+modelRole: factless-fact
+rationale:
+  purpose: "An area can sit in several workgroups, so branch and workgroup are a bridge, not a column on the carer row."
+  grainChoice: "Carer grain, not area grain: the carer table's RLS (TenantArea included) flows down the relationship, so a restricted admin's slicers list only their own branches, and all_carers_sv can count carers per branch on it."
+  design: "Power BI - bridge[carer_key] *:1 all_carers[carer_key] with cross-filter BOTH, slicers on branch_name and workgroup_name (blank branch left out of the Branch slicer). Every live workgroup of the area, with its live branch where it has one, the same rule as mart__bridge_client_workgroup (decided 2026-10-27); a carer whose area is in no live workgroup has no row."
+  roleChoice: "mart__area_scope keeps the links as ids for the TenantArea role and also keeps paths this bridge drops; it must not be swapped for this table."
+columns:
+  - name: source
+    dataType: "VARCHAR"
+    description: "Tenant token of the source schema the row came from. Opens the grain."
+    isNaturalKey: true
+  - name: carer_id
+    dataType: "NUMBER(38,0)"
+    description: "Carer key. Grain with source + workgroup_id + branch_id. Power BI relates on carer_key."
+    isNaturalKey: true
+  - name: carer_key
+    dataType: "NUMBER(38,0)"
+    description: "Relationship key to mart__all_carers_report — source_key(source, carer_id)."
+    isForeignKey: true
+  - name: workgroup_id
+    dataType: "NUMBER(38,0)"
+    description: "Workgroup id (cmLevelAreaWorkgroup.workgroupId)."
+    isNaturalKey: true
+  - name: workgroup_name
+    dataType: "VARCHAR"
+    description: "Workgroup name (cmLevelWorkgroup.name) — the Workgroup slicer value."
+  - name: branch_id
+    dataType: "NUMBER(38,0)"
+    description: "Branch id (cmLevelWorkgroupBranch.branchId); null for a workgroup with no live branch."
+    isNaturalKey: true
+  - name: branch_name
+    dataType: "VARCHAR"
+    description: "Branch name (cmLevelBranch.name) — the Branch slicer value; null with branch_id. Not the location."
+  - name: company_id
+    dataType: "NUMBER(38,0)"
+    description: "Company key, from the carer. RLS key (with location_id)."
+  - name: location_id
+    dataType: "NUMBER(38,0)"
+    description: "Location key, from the carer. RLS key (with company_id)."

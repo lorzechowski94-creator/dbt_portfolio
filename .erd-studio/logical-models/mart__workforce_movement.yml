@@ -1,0 +1,59 @@
+name: mart__workforce_movement
+schema: care_management
+description: Headcount and movement of the Workforce Capacity report — staff and customers active at the end of each day, and the joiners and leavers dated on it, per location and area, from its first recorded start up to today.
+grain: One row per location_key + area_id + calendar_date
+modelRole: periodic-snapshot
+rationale:
+  purpose: The Staff & Customer Movement cards, the headcount trend and the joiners-vs-leavers chart.
+  grainChoice: Location area per day rather than person per day — the cards need balances and counts, not names, and a person-day grain would be tens of millions of rows of employment spells. The area (the person's current one) is in the grain for the embedded TenantArea role; a null area (free text) is a bucket of its own. Days with nobody active and no movement are left out.
+  design: Built from int__carer_employment_spell and int__client_service_spell (their descriptions carry the joiner/leaver rules and profiling). Active is a running sum of joins minus leaves, so active(d) - active(d - 1) = joined(d) - left(d) on every row. Full rebuild each run — the source knows only the current state, and a reactivation clears the leave stamp, rewriting that person's history.
+  measures: active_* are semi-additive balances — sum across locations and areas, take the last day of a period (LASTNONBLANK), never a SUM over dates. *_joined / *_left are additive.
+columns:
+  - name: source
+    dataType: VARCHAR
+    description: Tenant token of the source schema the row came from. Opens the grain.
+    isNaturalKey: true
+  - name: calendar_date
+    dataType: DATE
+    description: The day. Relates to dim_date.
+    isNaturalKey: true
+    isForeignKey: true
+  - name: company_id
+    dataType: NUMBER(38,0)
+    description: Company key, from the location. RLS key (with location_id).
+  - name: location_id
+    dataType: NUMBER(38,0)
+    description: Location key (carer.location / client.location). RLS key (with company_id).
+  - name: area_id
+    dataType: NUMBER(38,0)
+    description: "The person's current area (carer.area / client.area as a number) — the key the embedded TenantArea role filters on. Null where the source holds the area as free text."
+    isNaturalKey: true
+  - name: location_key
+    dataType: NUMBER(38,0)
+    description: Power BI relationship key to dim_location — source_key(source, location_id). The fact's tenant boundary.
+    isForeignKey: true
+    isNaturalKey: true
+  - name: active_staff
+    dataType: NUMBER(38,0)
+    description: Care workers in the workforce at the end of the day.
+    additiveType: semi-additive
+  - name: staff_joined
+    dataType: NUMBER(38,0)
+    description: Care workers whose start_date is this day.
+    additiveType: additive
+  - name: staff_left
+    dataType: NUMBER(38,0)
+    description: Care workers whose leave_date is this day (moved out of Active — Archived or Pending).
+    additiveType: additive
+  - name: active_customers
+    dataType: NUMBER(38,0)
+    description: Clients active at the end of the day.
+    additiveType: semi-additive
+  - name: customers_joined
+    dataType: NUMBER(38,0)
+    description: Clients whose start_date is this day.
+    additiveType: additive
+  - name: customers_left
+    dataType: NUMBER(38,0)
+    description: Clients whose leave_date is this day (moved out of Active — Archived or Pending).
+    additiveType: additive

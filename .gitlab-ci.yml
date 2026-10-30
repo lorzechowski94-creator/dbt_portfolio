@@ -1,0 +1,592 @@
+spec:
+  inputs:
+    deploy:
+      description: >-
+        What a SCHEDULED pipeline does. Set this in the schedule's Inputs:
+        dev = refresh the DEV account; prod_r1 / prod_r2 / prod_r3 = deploy that
+        prod; all = every account at once. `all` also works from "Run pipeline"
+        on main, where the four build jobs then start without a click — with
+        full_refresh=true that is one full refresh of every account. Ignored by
+        merge-request / push pipelines (they use the default).
+      default: "dev"
+      options:
+        - "dev"
+        - "prod_r1"
+        - "prod_r2"
+        - "prod_r3"
+        - "all"
+    full_refresh:
+      description: >-
+        true = append --full-refresh, rebuilding every incremental model from
+        scratch. Set it in the schedule's Inputs, or in the "Run pipeline" form
+        before clicking a manual deploy job — the value is fixed when the
+        pipeline is created, so choose it there, not at click time.
+      default: "false"
+      options:
+        - "false"
+        - "true"
+---
+# GitLab CI/CD for the care_analytics dbt project (Snowflake, OIDC / Workload Identity).
+#
+# The root profiles.yml is gitignored, so CI uses the committed ci/profiles.yml
+# (DBT_PROFILES_DIR=ci). No stored secret in the repo.
+#
+# Trunk-based: everything ships from `main`. The two environments are dbt targets
+# (separate Snowflake accounts), NOT separate branches:
+#   dev     -> DEV account     (MYORG-DEV)
+#   prod_r1 -> R1 PROD account (MYORG-PROD_R1)
+#   prod_r2 -> R2 PROD account (MYORG-PROD_R2)
+#
+# EVERY BUILD JOB HAS TWO PHASES (dbt_project.yml, macros/assert_care_target.sql):
+#   1. once per care, $DBT_CARE — raw_access + staging, each care into its own
+#      schema and its own --target-path so the runs do not clobber each other's
+#      manifest, plus the account-wide role map they read (models/access/, rebuilt
+#      identically by each care's run). dev holds CARE1 only, prod_r1 CARE1/CARE4,
+#      prod_r2 CARE2/CARE3/CARE5/BETA, prod_r3 ALPHA/ALPHA2. Split in two: the models the
+#      shared phase READS gate it, the raw_access passthroughs that feed nothing
+#      do not — one of those failing reddens the job and stops nothing, exactly as
+#      before the split.
+#   2. once per account — intermediate + marts + report, which read EVERY care at
+#      once and carry the care as a column. It must run AFTER the whole loop, and
+#      only if every gating build was clean: nothing in dbt orders it, because those
+#      models reach the per-care relations by name (macros/union_cares.sql).
+# assert_care_target refuses any build whose care does not match its target.
+#
+# ADDING A CARE (or a whole account/region): the checklist lives in the header of
+# macros/assert_care_target.sql. Two places in THIS file are on it — the deploy
+# job's `for CARE in ...` loop and the same loop in dbt_validate.
+# Both authenticate as the SERVICE user SVC_DBT_CI via Workload Identity Federation
+# (OIDC): each build job requests `id_tokens: SNOWFLAKE_TOKEN` (aud:
+# snowflakecomputing.com), which ci/profiles.yml consumes as SNOWFLAKE_TOKEN — no
+# private key, nothing to rotate. SVC_DBT_CI must be bootstrapped in EACH account
+# (WORKLOAD_IDENTITY: ISSUER https://gitlab.com, SUBJECT project_path:<this repo>)
+# — see ci/bootstrap-wif.sql.
+# Optional override: DBT_SNOWFLAKE_WAREHOUSE.
+
+image: python:3.11-slim
+
+variables:
+  DBT_PROFILES_DIR: "ci"
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  # Driven by the `deploy` input; the schedule's Inputs box sets it. Rules below
+  # branch on $DBT_DEPLOY (dev | prod_r1 | prod_r2 | prod_r3 | all).
+  DBT_DEPLOY: "$[[ inputs.deploy ]]"
+  # Escape hatch: "true" appends --full-refresh (see the full_refresh input).
+  # To full-refresh a PROD deploy: "Run pipeline" on main with full_refresh=true,
+  # then click the manual deploy job in THAT pipeline — it inherits the value.
+  # Clicking the button on an existing pipeline cannot change it.
+  # To full-refresh EVERY account: "Run pipeline" on main with deploy=all and
+  # full_refresh=true. The four build jobs start on their own, in parallel — each
+  # holds its own account's resource_group, so none waits on another.
+  # Routine runs do NOT need this: the marts floor their lookback at 2000-01-01,
+  # so an empty table already rebuilds its full history on a normal run. Reach for
+  # it when a backfill must re-read history the rolling window no longer covers.
+  DBT_FULL_REFRESH: "$[[ inputs.full_refresh ]]"
+
+stages:
+  - validate
+  - build
+
+# Shared setup: install dbt-snowflake, and resolve the full_refresh input into
+# $FR. GitLab runs before_script and script in ONE shell, so $FR is visible to
+# every build command below. Plain if/then/fi, not `[ ... ] && ...` — the script
+# runs under `set -e`, so a one-liner would exit non-zero (and fail the job)
+# whenever DBT_FULL_REFRESH is "false".
+# No `dbt deps`: the project has no packages.yml, so there is nothing to resolve.
+# Add the call back (and dbt_packages/ to the cache) the day a package is added.
+.dbt_setup: &dbt_setup
+  before_script:
+    - pip install --upgrade pip
+    - pip install -r requirements.txt
+    - dbt --version
+    - if [ "$DBT_FULL_REFRESH" = "true" ]; then FR="--full-refresh"; else FR=""; fi
+    # single-quoted: an unquoted YAML scalar containing ": " parses as a mapping
+    - 'echo "full refresh: ${DBT_FULL_REFRESH:-false}"'
+
+# Keyed on requirements.txt rather than the branch: every branch shares one pip
+# cache, invalidated only when the dbt pin moves. The previous per-branch key
+# meant each new MR re-downloaded dbt-snowflake from scratch.
+# pip's cache is content-addressed, so the sqlfluff_lint job (which pins its own
+# version inline) sharing this key is harmless — at worst a miss.
+cache:
+  key:
+    files:
+      - requirements.txt
+  paths:
+    - .cache/pip
+
+# Code validation — runs on every merge request and on pushes to main.
+# `dbt parse` needs NO warehouse connection (and no token). `dbt compile` is
+# intentionally NOT run here: an incremental model (is_incremental) forces a
+# warehouse connection, which validation deliberately avoids.
+dbt_validate:
+  stage: validate
+  <<: *dbt_setup
+  script:
+    # Parse EVERY care, not just the default. The care drives +schema and the source
+    # schema, so each one resolves a different set of relations and a bare
+    # `dbt parse` would leave the others unvalidated until the deploy. Offline and
+    # ~7s per care. Each care needs the target whose account holds it, otherwise
+    # assert_care_target rejects the pair.
+    #
+    # Relation NAMES no longer differ per care — nothing is care-prefixed any more
+    # (macros/generate_alias_name.sql). What still differs is what the intermediate
+    # models READ: union_cares emits one branch per care in the ACCOUNT, so the same
+    # model renders one branch on dev and four on prod_r2. That is per account, not
+    # per care, which is why the two dry runs below are enough.
+    - dbt parse --target dev
+    - for CARE in care1 care4; do DBT_CARE="$CARE" dbt parse --target prod_r1 --target-path "target/$CARE"; done
+    - for CARE in care2 care3 care5 beta; do DBT_CARE="$CARE" dbt parse --target prod_r2 --target-path "target/$CARE"; done
+    - for CARE in alpha alpha2; do DBT_CARE="$CARE" dbt parse --target prod_r3 --target-path "target/$CARE"; done
+    # Render the semantic view DDL too. dry_run only logs, so it needs NO warehouse
+    # connection and no token — this job has neither. It catches a Jinja error or a
+    # renamed report model breaking ref() on the MR instead of on a deploy, which a
+    # bare `dbt parse` does not: a run-operation macro body is never parsed for it.
+    # Two runs, not seven: the views are ONE SET PER ACCOUNT, unprefixed, so the
+    # only thing that varies is the account — a single-care one (dev) and a
+    # multi-care one (prod_r2). Every other care/target pair renders one of those.
+    # Double-quoted: the --args value contains ": ", and an unquoted YAML scalar
+    # holding that parses as a mapping instead of a string (same trap as the echo
+    # in .dbt_setup).
+    - "dbt run-operation create_semantic_views --args '{dry_run: true}' --target dev"
+    - "DBT_CARE=care2 dbt run-operation create_semantic_views --args '{dry_run: true}' --target prod_r2 --target-path target/care2_sv"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != "schedule"'
+
+# SQLFluff linting. Uses the jinja templater (see .sqlfluff), so it needs no
+# warehouse connection, no dbt, and no secrets — just sqlfluff.
+sqlfluff_lint:
+  stage: validate
+  before_script:
+    - pip install --upgrade pip
+    - pip install sqlfluff==3.3.1
+  script:
+    - sqlfluff lint models
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != "schedule"'
+
+# DEV refresh -> full build (run + test) into the DEV account. `dbt build` would
+# also cover seeds and snapshots; this project has neither, so in practice it is
+# models plus their tests.
+# AUTO on a scheduled pipeline on main whose `deploy` input is `dev` (the
+# default). Prod schedules set the `deploy` input to prod_r1 / prod_r2 / prod_r3.
+# Also AUTO on a scheduled or "Run pipeline" pipeline on main whose `deploy`
+# input is `all`, alongside the three prod jobs.
+dbt_dev_refresh:
+  stage: build
+  <<: *dbt_setup
+  # Serialises against itself: a schedule that fires while the previous refresh
+  # is still running queues instead of pointing a second dbt at the same account.
+  # See dbt_deploy_prod_r2 for why that matters.
+  resource_group: dev
+  timeout: 1h
+  retry:
+    max: 2
+    when: [runner_system_failure]
+  id_tokens:
+    SNOWFLAKE_TOKEN:
+      aud: snowflakecomputing.com
+  script:
+    # Source freshness is ADVISORY: it reports and never blocks (see
+    # dbt_deploy_prod_r2 for the reasoning). Own --target-path because it writes
+    # run_results.json too and would otherwise clobber the build's copy.
+    - FRESH=0; dbt source freshness --target dev --target-path target/freshness || FRESH=$?
+    - if [ $FRESH -ne 0 ]; then echo "WARNING - stale or unreadable sources (dbt source freshness exited $FRESH); building anyway"; fi
+    # DEV holds CARE1 only -> one care to loop over, but the build is still TWO
+    # PHASES, because the shared phase reads the per-care relations by NAME and dbt
+    # cannot order it (macros/union_cares.sql). In one invocation it could build a
+    # mart from the previous staging definition on a deploy that changed one.
+    # DBT_CARE is unset, so it defaults to care1 (dbt_project.yml);
+    # assert_care_target confirms that matches the account.
+    - dbt build --target dev --select +path:models/staging +path:models/access $FR
+    # Account-wide: intermediate + marts + report, over every care at once.
+    - DBT_CARE=care1 dbt build --target dev --select tag:shared $FR
+    # Semantic views for the MCP server (macros/create_semantic_views.sql). AFTER
+    # the build: the DDL ref()s the report views, so on a first-ever build it would
+    # name relations that do not exist yet. `build` does not run run-operations, so
+    # this line is the only thing that creates them.
+    # Its own --target-path because run-operation ALSO writes run_results.json, and
+    # would otherwise overwrite the build's copy in the uploaded artifact.
+    # Under `set -e` a failed build skips this — deliberate: a semantic view over a
+    # tree that did not refresh is worse than no semantic view.
+    # NOTE this lands in the DEV account's CLEAN `report` schema, alongside the
+    # hand-made semantic view and MCP server that are not in this repo.
+    - DBT_CARE=care1 dbt run-operation create_semantic_views --target dev --target-path target/semantic_views
+    # LAST, and deliberately so. These raw_access passthroughs feed nothing;
+    # they are maintained because raw_access mirrors the care. This job is a plain
+    # command list under `set -e`, so one of them failing aborts the rest — which
+    # is why they run after the marts, the report views and the semantic views
+    # rather than before. The job still goes red, nothing else is held back.
+    - dbt build --target dev --exclude tag:shared --exclude +path:models/staging --exclude +path:models/access $FR
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $DBT_DEPLOY == "dev"'
+    - if: '($CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "web") && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $DBT_DEPLOY == "all"'
+  artifacts:
+    when: always
+    paths:
+      - target/
+    expire_in: 1 week
+
+# PROD (R1) deploy -> full build into the R1 prod account. This is the promotion:
+# pick the main commit you want live and run this job. Bound to the `production_r1`
+# environment (Deployments > Environments tracks the live commit; add Protected
+# Environments approvals for a gated Approve button). Triggers:
+#   - MANUAL "Run" button on every push to main (post-merge) -> deploy that commit.
+#   - MANUAL "Run pipeline" on main from the UI -> ad-hoc redeploy.
+#   - AUTO on a scheduled pipeline whose `deploy` input is prod_r1 -> prod refresh.
+#   - AUTO on a scheduled or "Run pipeline" pipeline on main whose `deploy` input
+#     is all -> every account at once (with full_refresh=true: full refresh).
+# The `all` rule sits ABOVE the manual "web" rule: rules stop at the first match,
+# so below it a Run-pipeline with deploy=all would still wait for a click.
+# Prod stays on the last deployed commit until you deploy a newer one.
+# allow_failure: false so a failed deploy turns the pipeline red (a manual job
+# that is never clicked does not block the pipeline).
+dbt_deploy_prod_r1:
+  stage: build
+  <<: *dbt_setup
+  # Per-account mutual exclusion, timeout and infra-only retry — see
+  # dbt_deploy_prod_r2 for why each is set the way it is.
+  resource_group: production_r1
+  timeout: 2h
+  retry:
+    max: 2
+    when: [runner_system_failure]
+  id_tokens:
+    SNOWFLAKE_TOKEN:
+      aud: snowflakecomputing.com
+  script:
+    # R1 PROD holds CARE1 and CARE4. TWO PHASES: the per-care loop builds each
+    # care's own schemas, then ONE shared run builds intermediate + marts + report
+    # over every care at once. Same shape as dbt_deploy_prod_r2; read that job's
+    # comments for the exit-code policy and for why the freshness check only warns.
+    - |
+      RC=0
+      FATAL=0
+      GATE=0
+      # The account's cares are listed ONCE, here. GUARD_CARE picks one of them up
+      # from the loop rather than naming a care a second time: the shared phase
+      # below is not care-scoped, but assert_care_target still runs there and
+      # refuses a care this account does not hold. Any of them satisfies it.
+      for CARE in care1 care4; do
+        GUARD_CARE="$CARE"
+        echo "=== source freshness $CARE ==="
+        FRESH=0
+        DBT_CARE="$CARE" dbt source freshness --target prod_r1 --target-path "target/${CARE}_freshness" || FRESH=$?
+        if [ $FRESH -ne 0 ]; then echo "WARNING - $CARE sources stale or unreadable (exit $FRESH); building anyway"; fi
+        # GATING BUILD: only what the shared phase actually reads — staging, the
+        # role map, and their raw_access ancestors. A failure here does
+        # invalidate the account-wide marts, so it sets GATE.
+        echo "=== building $CARE (sources for the shared phase) ==="
+        EC=0
+        DBT_CARE="$CARE" dbt build --target prod_r1 --target-path "target/$CARE" --select +path:models/staging +path:models/access $FR || EC=$?
+        [ $EC -eq 0 ] || RC=1
+        [ $EC -eq 0 ] || GATE=1
+        if [ $EC -eq 2 ]; then echo "fatal error (exit 2) - skipping remaining cares"; FATAL=1; break; fi
+        # THE REMAINING raw_access PASSTHROUGHS, which nothing downstream reads.
+        # They exist because raw_access mirrors the care, not because any report
+        # needs them, so one failing — a table absent from this care, which does
+        # happen — reddens the job and NOTHING else. Deliberately NOT gating: before
+        # the two-phase split such a failure left every mart building normally, and
+        # it has to keep doing so.
+        echo "=== building $CARE (remaining raw_access passthroughs) ==="
+        EL=0
+        DBT_CARE="$CARE" dbt build --target prod_r1 --target-path "target/${CARE}_leaf" --exclude tag:shared --exclude +path:models/staging --exclude +path:models/access $FR || EL=$?
+        [ $EL -eq 0 ] || RC=1
+      done
+      # The shared phase reads EVERY care's relations by name, so a care that did
+      # not build leaves it reading that care's previous refresh. Run it only when
+      # the whole loop succeeded; a partial account-wide mart is worse than a stale
+      # one, because nothing downstream can tell which cares are current.
+      # $GATE, not $RC: a failed passthrough above reddens the job without
+      # invalidating a single mart row, so it must not hold the marts back.
+      if [ $GATE -eq 0 ] && [ $FATAL -eq 0 ]; then
+        echo "=== building shared (intermediate + marts + report, all cares) ==="
+        SE=0
+        DBT_CARE=$GUARD_CARE dbt build --target prod_r1 --target-path target/shared --select tag:shared $FR || SE=$?
+        [ $SE -eq 0 ] || RC=1
+        if [ $SE -eq 0 ]; then
+          # ONE set of semantic views per account now — the report views they sit
+          # over are account-wide (macros/create_semantic_views.sql).
+          echo "=== semantic views ==="
+          SC=0
+          DBT_CARE=$GUARD_CARE dbt run-operation create_semantic_views --target prod_r1 --target-path target/sv || SC=$?
+          [ $SC -eq 0 ] || RC=1
+        else
+          echo "=== semantic views SKIPPED (shared build exited $SE) ==="
+        fi
+      else
+        echo "=== shared phase SKIPPED (a care's source build failed) ==="
+      fi
+      exit $RC
+  environment:
+    name: production_r1
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $DBT_DEPLOY == "prod_r1"'
+    - if: '($CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "web") && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $DBT_DEPLOY == "all"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+      when: manual
+      allow_failure: false
+    - if: '$CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: false
+  artifacts:
+    when: always
+    paths:
+      - target/
+    expire_in: 1 week
+
+# PROD (R2) deploy -> full build into the R2 prod account (MYORG-PROD_R2).
+# Same promotion model as dbt_deploy_prod_r1, separate `production_r2` environment.
+# AUTO on a scheduled pipeline that sets DBT_DEPLOY=prod_r2, and with the other
+# accounts when DBT_DEPLOY=all (see dbt_deploy_prod_r1).
+# R2's ANALYTICS_RAW holds CARE2/CARE3/CARE5/BETA (no CARE1) -> one dbt run per care,
+# SEQUENTIALLY in one job rather than a `parallel: matrix:` fan-out. Nothing is
+# shared between the cares any more, so what keeps this sequential is the
+# exit-code policy below: one job that can report "care3 failed, the others
+# refreshed".
+dbt_deploy_prod_r2:
+  stage: build
+  <<: *dbt_setup
+  # Mutual exclusion across pipelines. Without it GitLab will happily run two
+  # deploys at the same R2 account at once — a schedule firing while the previous
+  # one is still building, or someone clicking the manual button mid-refresh.
+  # Snowflake does not arbitrate that: concurrent `create or replace` interleaves,
+  # and the incremental models can silently merge the same rows twice. The second
+  # job now queues instead. Named per ACCOUNT, because that is what is being
+  # protected — R1/R3 are independent and deploy in parallel as before.
+  resource_group: production_r2
+  # Explicit, rather than inheriting the project default (1h). A timeout kills
+  # the job mid-care and leaves prod half-refreshed, so it must be comfortably
+  # above the real runtime of four sequential cares — tune once you have a few
+  # runs to measure. A runner-level maximum, if one is set, still wins.
+  timeout: 2h
+  # Infrastructure only. A dropped runner is not the code's fault and would
+  # otherwise strand prod half-built. Deliberately NOT stuck_or_timeout_failure:
+  # a build that overran its timeout will most likely overrun it again, and the
+  # retry costs another few hours of warehouse credits to reach the same red job.
+  retry:
+    max: 2
+    when: [runner_system_failure]
+  id_tokens:
+    SNOWFLAKE_TOKEN:
+      aud: snowflakecomputing.com
+  script:
+    # One build per care, each into its own --target-path so the manifests (and
+    # the uploaded target/ artifact) stay separate and identifiable. The RLS row-
+    # access map needs no special handling: it is ONE account-wide table built from
+    # every care's raw `location` (models/access/), so each care's run rebuilds the
+    # same table, atomically, in DAG order ahead of the views whose predicate reads
+    # it.
+    #
+    # Exit-code policy: a NODE failure (dbt exit 1 — a failing model or data test)
+    # is care-local, so record it and carry on; the other cares still refresh, which
+    # is what the old single-invocation job did. A FATAL error (exit 2 — compilation,
+    # bad credentials, unreachable account) would fail every care identically, so
+    # stop rather than reproduce the same traceback once per care. `exit $RC` turns the
+    # job red if any care failed.
+    # `|| EC=$?` and not `; EC=$?`: the job runs under `set -e`, which would abort
+    # the script the instant dbt exited non-zero, before the status was captured.
+    #
+    # SOURCE FRESHNESS runs first, per care, and is ADVISORY — it records $FRESH
+    # and never touches $RC. Without it a stalled ingestion into ANALYTICS_RAW looks
+    # exactly like a healthy one: the build rebuilds every mart from yesterday's
+    # rows and goes green. This at least puts "stale" in the job log.
+    #
+    # WARN ONLY since models/sources.yml dropped error_after: the first runs that
+    # actually executed the check failed roughly half of the 66 sources, nearly all
+    # of them lookup tables that are stale by nature. The wall of [ERROR] made the
+    # step unreadable, which is worse than not running it. The reasoning, and what
+    # would have to happen to re-introduce a hard threshold, is in sources.yml.
+    # $FRESH therefore stays 0 on a normal run; a non-zero value now means the check
+    # could not RUN (a missing table or column), not that data is old.
+    # freshness writes run_results.json as well, so it gets its own --target-path
+    # for the same reason the semantic views do.
+    #
+    # TWO PHASES. The loop builds each care's OWN schemas (raw_access, staging)
+    # and the role map. The shared run after it builds intermediate + marts +
+    # report, which are account-wide: they read every care's relations at once by
+    # NAME, so dbt cannot order them after the loop and this script has to
+    # (macros/union_cares.sql).
+    - |
+      RC=0
+      FATAL=0
+      GATE=0
+      # The account's cares are listed ONCE, here. GUARD_CARE picks one of them up
+      # from the loop rather than naming a care a second time: the shared phase
+      # below is not care-scoped, but assert_care_target still runs there and
+      # refuses a care this account does not hold. Any of them satisfies it.
+      for CARE in care2 care3 care5 beta; do
+        GUARD_CARE="$CARE"
+        echo "=== source freshness $CARE ==="
+        FRESH=0
+        DBT_CARE="$CARE" dbt source freshness --target prod_r2 --target-path "target/${CARE}_freshness" || FRESH=$?
+        if [ $FRESH -ne 0 ]; then echo "WARNING - $CARE sources stale or unreadable (exit $FRESH); building anyway"; fi
+        # GATING BUILD: only what the shared phase actually reads — staging, the
+        # role map, and their raw_access ancestors. A failure here does
+        # invalidate the account-wide marts, so it sets GATE.
+        echo "=== building $CARE (sources for the shared phase) ==="
+        EC=0
+        DBT_CARE="$CARE" dbt build --target prod_r2 --target-path "target/$CARE" --select +path:models/staging +path:models/access $FR || EC=$?
+        [ $EC -eq 0 ] || RC=1
+        [ $EC -eq 0 ] || GATE=1
+        if [ $EC -eq 2 ]; then echo "fatal error (exit 2) - skipping remaining cares"; FATAL=1; break; fi
+        # THE REMAINING raw_access PASSTHROUGHS, which nothing downstream reads.
+        # They exist because raw_access mirrors the care, not because any report
+        # needs them, so one failing — a table absent from this care, which does
+        # happen — reddens the job and NOTHING else. Deliberately NOT gating: before
+        # the two-phase split such a failure left every mart building normally, and
+        # it has to keep doing so.
+        echo "=== building $CARE (remaining raw_access passthroughs) ==="
+        EL=0
+        DBT_CARE="$CARE" dbt build --target prod_r2 --target-path "target/${CARE}_leaf" --exclude tag:shared --exclude +path:models/staging --exclude +path:models/access $FR || EL=$?
+        [ $EL -eq 0 ] || RC=1
+      done
+      # ONLY WHEN EVERY CARE BUILT. The shared phase stacks all three cares into one
+      # set of marts, so a care that failed does not produce a missing care — it
+      # produces a mart silently mixing today's rows with that care's last refresh,
+      # and nothing downstream can tell which is which. Same reasoning as the
+      # semantic views below, one layer up.
+      # $GATE, not $RC: a failed passthrough above reddens the job without
+      # invalidating a single mart row, so it must not hold the marts back.
+      if [ $GATE -eq 0 ] && [ $FATAL -eq 0 ]; then
+        echo "=== building shared (intermediate + marts + report, all cares) ==="
+        SE=0
+        DBT_CARE=$GUARD_CARE dbt build --target prod_r2 --target-path target/shared --select tag:shared $FR || SE=$?
+        [ $SE -eq 0 ] || RC=1
+        # Semantic views (macros/create_semantic_views.sql). ONE set per account now:
+        # the report views they sit over are account-wide, so a per-care invocation
+        # would create three identical objects each exposing all three cares.
+        # `dbt build` does not run run-operations, so without this line the DDL never
+        # executes anywhere.
+        # ONLY ON A CLEAN BUILD. A `dbt build` treats a failing test as a stop signal
+        # for everything downstream, so a node failure can mean the whole mart tree
+        # was skipped — that is what happened on 2026-09-07, when 3 null `created`
+        # values in care3 skipped 40 models and this step then failed on a dim_client
+        # that had never been built. Running the DDL over a half-built tree buys
+        # nothing and buries the real error under a Snowflake compilation error three
+        # levels away from the cause.
+        # Its own --target-path: run-operation writes run_results.json too and would
+        # overwrite the build's copy in the uploaded target/ artifact.
+        # A DDL failure sets RC, so the job goes red without touching the data that
+        # was already built.
+        if [ $SE -eq 0 ]; then
+          echo "=== semantic views ==="
+          SC=0
+          DBT_CARE=$GUARD_CARE dbt run-operation create_semantic_views --target prod_r2 --target-path target/sv || SC=$?
+          [ $SC -eq 0 ] || RC=1
+        else
+          echo "=== semantic views SKIPPED (shared build exited $SE) ==="
+        fi
+      else
+        echo "=== shared phase SKIPPED (a care's source build failed) ==="
+      fi
+      exit $RC
+  environment:
+    name: production_r2
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $DBT_DEPLOY == "prod_r2"'
+    - if: '($CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "web") && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $DBT_DEPLOY == "all"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+      when: manual
+      allow_failure: false
+    - if: '$CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: false
+  artifacts:
+    when: always
+    paths:
+      - target/
+    expire_in: 1 week
+
+# PROD (R3) deploy -> full build into the R3 prod account (MYORG-PROD_R3).
+# Identical in shape to dbt_deploy_prod_r2 — read that job's comments for the
+# exit-code policy. Two differences, both cosmetic:
+# R3's tenant schemas are ALPHA / ALPHA2 rather than careN (DBT_CARE carries the schema
+# name whatever it is), and this job has its own `production_r3` environment so
+# the three prods are promoted, tracked and approved independently.
+dbt_deploy_prod_r3:
+  stage: build
+  <<: *dbt_setup
+  # Per-account mutual exclusion, timeout and infra-only retry — see
+  # dbt_deploy_prod_r2 for why each is set the way it is.
+  resource_group: production_r3
+  timeout: 2h
+  retry:
+    max: 2
+    when: [runner_system_failure]
+  id_tokens:
+    SNOWFLAKE_TOKEN:
+      aud: snowflakecomputing.com
+  script:
+    # TWO PHASES, same shape as dbt_deploy_prod_r2 — read that job's comments.
+    - |
+      RC=0
+      FATAL=0
+      GATE=0
+      # The account's cares are listed ONCE, here. GUARD_CARE picks one of them up
+      # from the loop rather than naming a care a second time: the shared phase
+      # below is not care-scoped, but assert_care_target still runs there and
+      # refuses a care this account does not hold. Any of them satisfies it.
+      for CARE in alpha alpha2; do
+        GUARD_CARE="$CARE"
+        echo "=== source freshness $CARE ==="
+        FRESH=0
+        DBT_CARE="$CARE" dbt source freshness --target prod_r3 --target-path "target/${CARE}_freshness" || FRESH=$?
+        if [ $FRESH -ne 0 ]; then echo "WARNING - $CARE sources stale or unreadable (exit $FRESH); building anyway"; fi
+        # GATING BUILD: only what the shared phase actually reads — staging, the
+        # role map, and their raw_access ancestors. A failure here does
+        # invalidate the account-wide marts, so it sets GATE.
+        echo "=== building $CARE (sources for the shared phase) ==="
+        EC=0
+        DBT_CARE="$CARE" dbt build --target prod_r3 --target-path "target/$CARE" --select +path:models/staging +path:models/access $FR || EC=$?
+        [ $EC -eq 0 ] || RC=1
+        [ $EC -eq 0 ] || GATE=1
+        if [ $EC -eq 2 ]; then echo "fatal error (exit 2) - skipping remaining cares"; FATAL=1; break; fi
+        # THE REMAINING raw_access PASSTHROUGHS, which nothing downstream reads.
+        # They exist because raw_access mirrors the care, not because any report
+        # needs them, so one failing — a table absent from this care, which does
+        # happen — reddens the job and NOTHING else. Deliberately NOT gating: before
+        # the two-phase split such a failure left every mart building normally, and
+        # it has to keep doing so.
+        echo "=== building $CARE (remaining raw_access passthroughs) ==="
+        EL=0
+        DBT_CARE="$CARE" dbt build --target prod_r3 --target-path "target/${CARE}_leaf" --exclude tag:shared --exclude +path:models/staging --exclude +path:models/access $FR || EL=$?
+        [ $EL -eq 0 ] || RC=1
+      done
+      # $GATE, not $RC: a failed passthrough above reddens the job without
+      # invalidating a single mart row, so it must not hold the marts back.
+      if [ $GATE -eq 0 ] && [ $FATAL -eq 0 ]; then
+        echo "=== building shared (intermediate + marts + report, all cares) ==="
+        SE=0
+        DBT_CARE=$GUARD_CARE dbt build --target prod_r3 --target-path target/shared --select tag:shared $FR || SE=$?
+        [ $SE -eq 0 ] || RC=1
+        if [ $SE -eq 0 ]; then
+          echo "=== semantic views ==="
+          SC=0
+          DBT_CARE=$GUARD_CARE dbt run-operation create_semantic_views --target prod_r3 --target-path target/sv || SC=$?
+          [ $SC -eq 0 ] || RC=1
+        else
+          echo "=== semantic views SKIPPED (shared build exited $SE) ==="
+        fi
+      else
+        echo "=== shared phase SKIPPED (a care's source build failed) ==="
+      fi
+      exit $RC
+  environment:
+    name: production_r3
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $DBT_DEPLOY == "prod_r3"'
+    - if: '($CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "web") && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $DBT_DEPLOY == "all"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+      when: manual
+      allow_failure: false
+    - if: '$CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: false
+  artifacts:
+    when: always
+    paths:
+      - target/
+    expire_in: 1 week

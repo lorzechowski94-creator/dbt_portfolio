@@ -1,0 +1,36 @@
+name: mart__dim_jobtype_group
+schema: care_management
+description: One row per job type GROUP (jobtypeGroupName). The Power BI slicer table for filtering the jobtype-grained reports by group instead of by individual job type.
+grain: One row per source + group_id
+modelRole: domain-dim
+rationale:
+  purpose: Put group_name on the slicer and let mart__bridge_jobtype_group expand it into raw job type ids — the facts only carry job_type_id.
+  roleChoice: Domain dimension — it is reached only through the bridge, never related to a fact directly.
+columns:
+  - name: source
+    dataType: VARCHAR
+    description: Tenant token of the source schema the row came from. Opens the grain.
+    isNaturalKey: true
+    scdType: 0
+  - name: group_id
+    dataType: NUMBER(38,0)
+    description: Group primary key (jobtypeGroupName.id). Grain WITH source — the id is allocated per care and repeats across them.
+    isNaturalKey: true
+    scdType: 0
+  - name: group_key
+    dataType: NUMBER(38,0)
+    description: Power BI relationship key — source_key(source, group_id). The "one" side of the relationship to mart__bridge_jobtype_group.
+    isPrimaryKey: true
+    scdType: 0
+  - name: group_name
+    dataType: VARCHAR
+    description: Group display name (jobtypeGroupName.name) — the slicer value.
+    scdType: 1
+  - name: company_id
+    dataType: NUMBER(38,0)
+    description: Company key (jobtypeGroupName.companyId). RLS key (with location_id).
+    scdType: 1
+  - name: location_id
+    dataType: NUMBER(38,0)
+    description: Location key (jobtypeGroupName.locationId). RLS key (with company_id).
+    scdType: 1

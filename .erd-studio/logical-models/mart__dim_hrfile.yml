@@ -1,0 +1,64 @@
+name: mart__dim_hrfile
+schema: care_management
+description: One row per HR file type (cmQualificationsType) - name, category and category label. The "HR File" slicer for mart__carer_qualification_report.
+grain: One row per source + qualification_type_id
+modelRole: domain-dim
+rationale:
+  purpose: Serves the HR File slicer; slice on hr_file_name (one entry per name, even though the source type table repeats each name per company/location).
+  design: Retired types are kept and MARKED via is_deleted / retired_date, never filtered out — facts reference them, the export shows them in red, and audit lookbacks reach back to when the type was still in use. Do not filter this dimension on is_deleted at page/report level; that propagates to the fact and drops history rows.
+columns:
+  - name: source
+    dataType: VARCHAR
+    description: Tenant token of the source schema the row came from. Opens the grain.
+    isNaturalKey: true
+    scdType: 0
+  - name: qualification_type_id
+    dataType: NUMBER(38,0)
+    description: Qualification type primary key (cmQualificationsType.id). Grain WITH source — the id is allocated per care and repeats.
+    isNaturalKey: true
+    scdType: 0
+  - name: hr_file_key
+    dataType: NUMBER(38,0)
+    description: Power BI relationship key — source_key(source, qualification_type_id). The "one" side of the relationship to mart__carer_qualification_report.
+    isPrimaryKey: true
+    scdType: 0
+  - name: hr_file_name
+    dataType: VARCHAR
+    description: HR file / qualification display name (cmQualificationsType.name). The slicer column.
+    scdType: 1
+  - name: category
+    dataType: NUMBER(38,0)
+    description: Raw category value (1-5, 100, 101, null); 100/101 are the Private/Confidential access-controlled categories.
+    scdType: 1
+  - name: hr_file_type
+    dataType: VARCHAR
+    description: HR File Type category label mapped from category; '' when category is null or unknown.
+    scdType: 1
+  - name: alert_before
+    dataType: VARCHAR
+    description: "Alert window of this type as typed in the app (cmQualificationsType.alertBefore): a count and a unit, '4 week', '1 month'; null when none is configured. For display — the fact's is_expiring is already resolved against it, so do not re-derive the flag in DAX."
+    scdType: 1
+  - name: alert_before_value
+    dataType: NUMBER(38,0)
+    description: "The count in alert_before (4 in '4 week'); null when there is no window or the text is not a count and a unit (macros/alert_before.sql)."
+    scdType: 1
+  - name: alert_before_unit
+    dataType: VARCHAR
+    description: "The unit in alert_before, normalised to day / week / month / year; null alongside alert_before_value."
+    scdType: 1
+  - name: is_deleted
+    dataType: BOOLEAN
+    description: True when the type is retired from the company's HR file list; false while in use. Never null. Use as a displayed column / conditional format, not as a report-level filter.
+    scdType: 1
+  - name: retired_date
+    dataType: DATE
+    description: Date the type was retired (cmQualificationsType.deleted cast to date); null while in use. Audit trail.
+    scdType: 1
+  - name: company_id
+    dataType: NUMBER(38,0)
+    description: Company key (cmQualificationsType.companyId). RLS key (with location_id).
+    scdType: 1
+  - name: location_id
+    dataType: NUMBER(38,0)
+    description: Location key (cmQualificationsType.locationId). RLS key (with company_id).
+    scdType: 1

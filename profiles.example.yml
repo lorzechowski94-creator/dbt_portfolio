@@ -1,0 +1,30 @@
+# Copy to profiles.yml (gitignored) for local development. CI uses
+# ci/profiles.yml instead (DBT_PROFILES_DIR=ci).
+care_analytics:
+  target: dev
+  outputs:
+
+    # Local development sandbox -> schemas prefixed with DBT_DEV_ (e.g. DBT_DEV_care1)
+    dev: &snowflake_defaults
+      type: snowflake
+      account: MYORG-DEV
+      user: "{{ env_var('DBT_SNOWFLAKE_USER') }}"
+      private_key_path: "{{ env_var('DBT_SNOWFLAKE_PRIVATE_KEY_PATH') }}"
+      private_key_passphrase: "{{ env_var('DBT_SNOWFLAKE_PRIVATE_KEY_PASSPHRASE') }}"
+      role: SYSADMIN
+      warehouse: WH_ANALYTICS_REPORTING_XS
+      database: ANALYTICS_RAW
+      schema: DBT_DEV
+      threads: 4
+
+    # CI pipeline on merge requests -> schemas prefixed with CI_ (e.g. CI_care1)
+    ci:
+      <<: *snowflake_defaults
+      schema: CI
+      threads: 8
+
+    # Production deploy from main -> clean schemas (care1, care_management, ...)
+    prod:
+      <<: *snowflake_defaults
+      schema: PROD
+      threads: 8

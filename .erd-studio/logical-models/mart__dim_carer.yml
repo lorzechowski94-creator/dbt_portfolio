@@ -1,0 +1,81 @@
+name: mart__dim_carer
+schema: care_management
+description: One row per carer with the demographic / display columns of the carer hours report and the RLS keys used by the report secure view over the fact. Scope - permissionId = 4, deleted IS NULL.
+grain: One row per source + carer_id
+modelRole: conformed-dim
+rationale:
+  purpose: The carer entity behind the carer hours, continuity, schedule difference and qualification facts.
+  roleChoice: Conformed dimension — four facts relate to it on carer_key.
+  design: Scope is permissionId = 4 AND deleted IS NULL, which is narrower than the facts admit. mart__schedule_difference_report therefore carries a WARN-severity relationships test rather than an error; if it fires, widen this dimension (keep + mark, as dim_hrfile does) rather than dropping fact rows.
+columns:
+  - name: source
+    dataType: VARCHAR
+    description: Tenant token of the source schema the row came from. Opens the grain.
+    isNaturalKey: true
+    scdType: 0
+  - name: carer_id
+    dataType: NUMBER(38,0)
+    description: Carer primary key (carer.id). Grain WITH source — the id is allocated per care and repeats across them.
+    isNaturalKey: true
+    scdType: 0
+  - name: carer_key
+    dataType: NUMBER(38,0)
+    description: Power BI relationship key — source_key(source, carer_id). The "one" side of every relationship into this dimension; the unique test on it fails in CI instead of at dataset load.
+    isPrimaryKey: true
+    scdType: 0
+  - name: carer_no
+    dataType: VARCHAR
+    description: Front-end carer reference number (carer.carerId).
+    scdType: 1
+  - name: surname
+    dataType: VARCHAR
+    description: Carer surname (carer.sname).
+    scdType: 1
+  - name: first_name
+    dataType: VARCHAR
+    description: Carer first name (carer.fname).
+    scdType: 1
+  - name: full_name
+    dataType: VARCHAR
+    description: First name + surname.
+    scdType: 1
+  - name: date_of_birth
+    dataType: DATE
+    description: Carer date of birth (carer.dob).
+    scdType: 0
+  - name: start_date
+    dataType: DATE
+    description: Carer employment start date (carer.startDate).
+    scdType: 1
+  - name: area_id
+    dataType: NUMBER(38,0)
+    description: "Area id (carer.area as a number). Branch-level RLS key: the TenantArea role keeps carers whose area belongs to one of the admin's allowed workgroups (mart__area_scope)."
+    scdType: 1
+  - name: area
+    dataType: VARCHAR
+    description: Area name (area.name via carer.area).
+    scdType: 1
+  - name: address
+    dataType: VARCHAR
+    description: Carer address line 1 (carer.address1).
+    scdType: 1
+  - name: town
+    dataType: VARCHAR
+    description: Carer town (carer.town).
+    scdType: 1
+  - name: county
+    dataType: VARCHAR
+    description: Carer county (carer.county).
+    scdType: 1
+  - name: position
+    dataType: VARCHAR
+    description: Position/role name (cmEmployeePositions.name via carer.position).
+    scdType: 1
+  - name: company_id
+    dataType: NUMBER(38,0)
+    description: Company key (carer.companyId). RLS key (with location_id).
+    scdType: 1
+  - name: location_id
+    dataType: NUMBER(38,0)
+    description: Location key (carer.location). RLS key (with company_id).
+    scdType: 1

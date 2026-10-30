@@ -1,0 +1,46 @@
+name: mart__bridge_carer_tag
+schema: care_management
+description: "One row per carer of mart__all_carers_report and each of their live tags. The Tags slicer of the All Carers report."
+grain: "One row per source + carer_id + tag_id"
+modelRole: factless-fact
+rationale:
+  purpose: "Legacy matches a carer holding ANY selected tag; a slicer on tag_name through this bridge gives exactly that."
+  design: "Power BI - bridge[carer_key] *:1 all_carers[carer_key] with cross-filter BOTH, slicer on tag_name filtered to is_carer_tag = TRUE (the tags the legacy filter offers). Restricted to the report's carers, so every row finds its carer; the RLS keys are the carer's."
+columns:
+  - name: source
+    dataType: "VARCHAR"
+    description: "Tenant token of the source schema the row came from. Opens the grain."
+    isNaturalKey: true
+  - name: carer_id
+    dataType: "NUMBER(38,0)"
+    description: "Carer key. Grain with source + tag_id. Power BI relates on carer_key."
+    isNaturalKey: true
+  - name: carer_key
+    dataType: "NUMBER(38,0)"
+    description: "Relationship key to mart__all_carers_report — source_key(source, carer_id)."
+    isForeignKey: true
+  - name: tag_id
+    dataType: "NUMBER(38,0)"
+    description: "Tag key (tag.id). Grain with source + carer_id."
+    isNaturalKey: true
+  - name: tag_key
+    dataType: "NUMBER(38,0)"
+    description: "source_key(source, tag_id), for a tag dimension should one be added."
+  - name: tag_name
+    dataType: "VARCHAR"
+    description: "Tag label (tag.tag) — the slicer value."
+  - name: tag_color
+    dataType: "VARCHAR"
+    description: "Tag colour (tag.color)."
+  - name: tag_category_id
+    dataType: "NUMBER(38,0)"
+    description: "Tag category (tag.tagCategoryId), the order of the comma-joined Tags column. Not a Sort by column for tag_name: one name can carry two categories across the companies of a model."
+  - name: is_carer_tag
+    dataType: "BOOLEAN"
+    description: "True for a carer-side tag (tag.carerSide = 1); the legacy filter offers only these."
+  - name: company_id
+    dataType: "NUMBER(38,0)"
+    description: "Company key, from the carer. RLS key (with location_id)."
+  - name: location_id
+    dataType: "NUMBER(38,0)"
+    description: "Location key, from the carer. RLS key (with company_id)."

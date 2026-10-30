@@ -1,0 +1,81 @@
+name: mart__dim_task_schedule
+schema: care_management
+description: "One row per task schedule (cmdailyTasksAssign): the task it is for (cmdailyTasks) and how it is scheduled. Holds the Task slicer and the Task Review page's Task column."
+grain: "One row per source + task_assign_id"
+modelRole: domain-dim
+rationale:
+  roleChoice: "A dimension of the Task Review fact only, related on task_schedule_key."
+  grainChoice: "Schedule, not task type: the fact then needs one key, and the schedule's own pattern and dates sit next to the task name. A task-type dimension would need a second key on the fact for the same slicer."
+  design: "The same schedules int__task_review expands: live, with a company, a location and a task row, of a client that is not deleted. A deleted task type keeps its schedules, as on the page."
+columns:
+  - name: source
+    dataType: "VARCHAR"
+    description: "Tenant token of the source schema the row came from. Opens the grain."
+    isNaturalKey: true
+    scdType: 0
+  - name: task_assign_id
+    dataType: "NUMBER(38,0)"
+    description: "cmdailyTasksAssign.id. Grain WITH source — the id is allocated per care."
+    isNaturalKey: true
+    scdType: 0
+  - name: task_schedule_key
+    dataType: "NUMBER(38,0)"
+    description: "Power BI relationship key — source_key(source, task_assign_id). The \"one\" side of the fact's relationship."
+    isPrimaryKey: true
+    scdType: 0
+  - name: client_id
+    dataType: "NUMBER(38,0)"
+    description: "The client the schedule is for (cmdailyTasksAssign.clientId)."
+    scdType: 1
+  - name: client_key
+    dataType: "NUMBER(38,0)"
+    description: "source_key(source, client_id). Informational: the fact relates to dim_client itself."
+    scdType: 1
+  - name: task_id
+    dataType: "NUMBER(38,0)"
+    description: "cmdailyTasksAssign.cmdailyTasksId, the task type."
+    scdType: 1
+  - name: task_name
+    dataType: "VARCHAR"
+    description: "The page's Task column (cmdailyTasks.name)."
+    scdType: 1
+  - name: is_task_deleted
+    dataType: "BOOLEAN"
+    description: "The task type is deleted (cmdailyTasks.deleted); its schedules still show, as on the page."
+    scdType: 1
+  - name: is_mandatory
+    dataType: "BOOLEAN"
+    description: "cmdailyTasksAssign.mandatory = 1, as stored. Not on the page."
+    scdType: 1
+  - name: schedule_pattern
+    dataType: "VARCHAR"
+    description: "How the schedule repeats, as text (Once, Weekly: Mon, Wed ..., Every N weeks: ..., Daily, Every N days). Not on the page."
+    scdType: 1
+  - name: date_start
+    dataType: "DATE"
+    description: "cmdailyTasksAssign.dateStart."
+    scdType: 1
+  - name: date_finish
+    dataType: "DATE"
+    description: "cmdailyTasksAssign.dateFinish; null for an open-ended schedule."
+    scdType: 1
+  - name: stopped_at
+    dataType: "TIMESTAMP_NTZ"
+    description: "cmdailyTasksAssign.stoppedDate. Informational — it ends no slots."
+    scdType: 1
+  - name: stop_reason
+    dataType: "VARCHAR"
+    description: "cmdailyTasksAssign.reasonStop."
+    scdType: 1
+  - name: location_key
+    dataType: "NUMBER(38,0)"
+    description: "source_key(source, location_id)."
+    scdType: 1
+  - name: company_id
+    dataType: "NUMBER(38,0)"
+    description: "The schedule's company. RLS key (with location_id)."
+    scdType: 1
+  - name: location_id
+    dataType: "NUMBER(38,0)"
+    description: "The schedule's location. RLS key (with company_id)."
+    scdType: 1

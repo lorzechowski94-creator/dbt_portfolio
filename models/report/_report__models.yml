@@ -1,0 +1,203 @@
+version: 2
+
+# Customer-facing secure views over the mart tables. RLS is enforced here via
+# customer_access_filter: because these are secure views, the CURRENT_ROLE()
+# predicate is evaluated at query time with the reader's role. The underlying
+# mart tables (care_management) hold all customers' data and must NOT be granted
+# to reader roles — only this schema (report) is customer-facing.
+
+models:
+  - name: report__dim_client
+    description: >
+      Secure, RLS-filtered view over mart__dim_client. One row per client,
+      restricted to the reader role's company/location. Relate to the report facts
+      on client_key.
+  - name: report__search_index
+    description: >
+      Secure, RLS-filtered view over mart__search_index. Every searchable value in
+      the account, one row per entity per attribute, restricted to the reader
+      role's company/location — every row carries the company_id/location_id of the
+      entity it indexes, so one predicate covers all six. Hide every column of it
+      in Power BI; only the text slicer and the Search Hit measure touch it.
+  - name: report__dim_jobtype
+    description: >
+      Secure, RLS-filtered view over mart__dim_jobtype. One row per job
+      type, restricted to the reader role's company/location.
+  - name: report__dim_jobtype_group
+    description: >
+      Secure, RLS-filtered view over mart__dim_jobtype_group. One row per
+      job type group, restricted to the reader role's company/location — the
+      group slicer table.
+  - name: report__bridge_jobtype_group
+    description: >
+      Secure, RLS-filtered view over mart__bridge_jobtype_group. One row
+      per (group, job type) pair; both key columns should be hidden in Power BI.
+  - name: report__client_hours_report
+    description: >
+      Secure, RLS-filtered view over the fact mart__client_hours_report
+      (grain client_key + service_date + job_type_key — serves both the
+      client-level and the job-type-grained report). RLS keys
+      (company_id/location_id) are resolved per client via
+      mart__dim_client. Output columns identical to the fact.
+  - name: report__carer_qualification_report
+    description: >
+      Secure, RLS-filtered view over the fact
+      mart__carer_qualification_report. The mart carries
+      company_id/location_id per row, so the filter applies directly. One row per
+      carer × qualification record; output columns identical to the fact.
+  - name: report__dim_hrfile
+    description: >
+      Secure, RLS-filtered view over mart__dim_hrfile. One row per HR file
+      type, restricted to the reader role's company/location — the HR File slicer
+      table for report__carer_qualification_report (relate on hr_file_key).
+  - name: report__schedule_difference_report
+    description: >
+      Secure, RLS-filtered view over the fact
+      mart__schedule_difference_report. RLS keys (company_id/location_id)
+      travel on each row, so the filter applies directly. One row per scheduled
+      call occurrence; output columns identical to the fact.
+
+  - name: report__dim_carer
+    description: >
+      Secure, RLS-filtered view over mart__dim_carer. One row per carer;
+      output columns identical to the dimension.
+
+  - name: report__carer_hours_report
+    description: >
+      Secure, RLS-filtered view over the fact mart__carer_hours_report.
+      The fact has no company/location, so RLS keys are looked up from
+      mart__dim_carer (LEFT join keeps SYSADMIN full access). Output
+      columns identical to the fact.
+
+  - name: report__dim_date
+    description: >
+      Secure view over mart__dim_date — the shared Power BI date table. The ONLY
+      report model with no customer_access_filter, deliberately: a calendar is
+      generated from a date spine, carries no company_id/location_id and exposes
+      nothing about any tenant. Adding a filter would not harden it, it would return
+      zero rows to every reader and blank every date slicer in the model. Still a
+      secure view so it grants like its siblings.
+
+  - name: report__continuity_report
+    description: >
+      Secure, RLS-filtered view over the fact
+      mart__continuity_report (grain client_key + service_date +
+      carer_key). The fact has no company/location, so RLS keys are looked up per
+      client via mart__dim_client (LEFT join keeps SYSADMIN full access). Output
+      columns identical to the fact. This is the table the continuity DAX measures
+      sit on — see the mart model header.
+
+  - name: report__birthday_report
+    description: >
+      Secure, RLS-filtered view over the fact mart__birthday_report. RLS keys
+      (company_id/location_id) travel on each row, so the filter applies
+      directly. One row per person (client or carer) with a usable date of birth;
+      output columns identical to the fact.
+
+  - name: report__anniversary_report
+    description: >
+      Secure, RLS-filtered view over the fact mart__anniversary_report. RLS keys
+      (company_id/location_id) travel on each row, so the filter applies
+      directly. One row per carer with a usable employment start date; output
+      columns identical to the fact.
+
+  - name: report__plans_taken_report
+    description: >
+      Secure, RLS-filtered view over the fact mart__plans_taken_report. RLS keys
+      (company_id/location_id) travel on each row, so the filter applies
+      directly. One row per plan started for a client or a carer; output columns
+      identical to the fact.
+
+  - name: report__dim_location
+    description: >
+      Secure, RLS-filtered view over mart__dim_location. One row per location,
+      restricted to the reader role's company/location — the Branch slicer and
+      tenant boundary of the Workforce Capacity report (relate on location_key).
+
+  - name: report__workforce_capacity
+    description: >
+      Secure, RLS-filtered view over the fact mart__workforce_capacity. RLS keys
+      (company_id/location_id) travel on each row, so the filter applies
+      directly. Grain location_key + area_id + carer_key + calendar_date; output
+      columns identical to the fact.
+
+  - name: report__workforce_movement
+    description: >
+      Secure, RLS-filtered view over the fact mart__workforce_movement. RLS keys
+      (company_id/location_id) travel on each row, so the filter applies
+      directly. One row per location, area and day; output columns identical to
+      the fact.
+
+  - name: report__all_carers_report
+    description: >
+      Secure, RLS-filtered view over mart__all_carers_report. RLS keys
+      (company_id/location_id) travel on each row, so the filter applies
+      directly. One row per Active, Pending or Archived care worker of a
+      location; output columns identical to the mart.
+
+  - name: report__bridge_carer_tag
+    description: >
+      Secure, RLS-filtered view over mart__bridge_carer_tag. One row per carer and
+      live tag, restricted by the carer's company/location — the Tags slicer table
+      of the All Carers report (relate on carer_key, cross-filter both).
+
+  - name: report__bridge_carer_workgroup
+    description: >
+      Secure, RLS-filtered view over mart__bridge_carer_workgroup. One row per
+      carer and workgroup / branch of their area, restricted by the carer's
+      company/location — the Branch and Workgroup slicer table of the All Carers
+      report (relate on carer_key, cross-filter both).
+
+  - name: report__all_clients_report
+    description: >
+      Secure, RLS-filtered view over mart__all_clients_report. RLS keys
+      (company_id/location_id) travel on each row, so the filter applies
+      directly. One row per Active, Pending or Archived client of a location;
+      output columns identical to the mart.
+
+  - name: report__bridge_client_tag
+    description: >
+      Secure, RLS-filtered view over mart__bridge_client_tag. One row per client
+      and live tag, restricted by the client's company/location — the Tags slicer
+      table of the All Clients report (relate on client_key, cross-filter both).
+
+  - name: report__bridge_client_workgroup
+    description: >
+      Secure, RLS-filtered view over mart__bridge_client_workgroup. One row per
+      client and workgroup / branch of their area, restricted by the client's
+      company/location — the Branch and Workgroup slicer table of the All Clients
+      report (relate on client_key, cross-filter both).
+
+  - name: report__bridge_client_job_type
+    description: >
+      Secure, RLS-filtered view over mart__bridge_client_job_type. One row per
+      client and live job type, restricted by the client's company/location — the
+      Job Type slicer table of the All Clients report (relate on client_key,
+      cross-filter both).
+
+  - name: report__assessments_report
+    description: >
+      Secure, RLS-filtered view over the fact mart__assessments_report. RLS keys
+      (company_id/location_id) travel on each row, so the filter applies
+      directly. One row per live assessment of a client; output columns
+      identical to the fact.
+
+  - name: report__skin_assessments_report
+    description: >
+      Secure, RLS-filtered view over the fact mart__skin_assessments_report. RLS
+      keys (company_id/location_id) travel on each row, so the filter applies
+      directly. One row per live entry of a client's wound record; output columns
+      identical to the fact.
+
+  - name: report__task_review_report
+    description: >
+      Secure, RLS-filtered view over the fact mart__task_review_report. RLS keys
+      (company_id/location_id) travel on each row, so the filter applies
+      directly. One row per scheduled task slot per day per result recorded on
+      it; output columns identical to the fact.
+
+  - name: report__dim_task_schedule
+    description: >
+      Secure, RLS-filtered view over mart__dim_task_schedule. One row per task
+      schedule, restricted to the reader role's company/location — the Task
+      slicer table of the Task Review report (relate on task_schedule_key).

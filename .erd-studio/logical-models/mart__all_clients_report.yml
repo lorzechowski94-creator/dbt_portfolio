@@ -1,0 +1,134 @@
+name: mart__all_clients_report
+schema: care_management
+description: "All Clients. One row per Active, Pending or Archived client the legacy All Clients page lists, whatever their area, workgroup or branch, as on the page; flat list, no dates, no totals. Ports clientsTotalAll.php / clientsTotalAllTableBc.php."
+grain: "One row per source + client_id (client_key)"
+modelRole: domain-dim
+rationale:
+  purpose: "A flat client list with every column the legacy page can show, current state only."
+  roleChoice: "Stands apart from mart__dim_client, which keeps every client of the client table (no state rule) for the hours facts."
+  design: "The legacy tab is the state slicer. Branch and Workgroup slice through mart__bridge_client_workgroup, Tags through mart__bridge_client_tag, Job Type through mart__bridge_client_job_type, all on client_key; location names come from mart__dim_location. Also the base of all_clients_sv. Column semantics, legacy quirks and the area handling are documented on int__all_clients."
+columns:
+  - name: source
+    dataType: "VARCHAR"
+    description: "Tenant token of the source schema the row came from. Opens the grain."
+    isNaturalKey: true
+  - name: client_key
+    dataType: "NUMBER(38,0)"
+    description: "source_key(source, client_id) — unique on its own; the one side of the relationships from the three client bridges. Same value as mart__dim_client's key."
+    isPrimaryKey: true
+  - name: client_id
+    dataType: "NUMBER(38,0)"
+    description: "Client primary key (client.id). Grain WITH source — the id is allocated per care and repeats across them."
+    isNaturalKey: true
+  - name: client_no
+    dataType: "VARCHAR"
+    description: "The report's No. column (residentId)."
+  - name: has_private_note
+    dataType: "BOOLEAN"
+    description: "Private-note warning icon in front of No. (client.privateNote = 1)."
+  - name: has_future_status_change
+    dataType: "BOOLEAN"
+    description: "Future-status icon in front of No. — a status change still to run."
+  - name: first_name
+    dataType: "VARCHAR"
+    description: "First name (fname)."
+  - name: surname
+    dataType: "VARCHAR"
+    description: "Surname (sname); the legacy Name column sorts by it."
+  - name: full_name
+    dataType: "VARCHAR"
+    description: "The report's Name column — first name + surname."
+  - name: gender
+    dataType: "VARCHAR"
+    description: "The report's Gender column — Female / Male (F / M, 2 / 1, or the word), null for any other code."
+  - name: address
+    dataType: "VARCHAR"
+    description: "The report's Address column — address line 1, town, county, post code, blanks skipped."
+  - name: address_line_1
+    dataType: "VARCHAR"
+    description: "Address line 1 (client.currentAddress1); with town, what the Address search matches."
+  - name: town
+    dataType: "VARCHAR"
+    description: "Town (client.currentTown)."
+  - name: county
+    dataType: "VARCHAR"
+    description: "The report's County column."
+  - name: post_code
+    dataType: "VARCHAR"
+    description: "The report's Post Code column."
+  - name: is_location_confirmed
+    dataType: "BOOLEAN"
+    description: "False when the client has no latitude — the Location not confirmed marker."
+  - name: branch_names
+    dataType: "VARCHAR"
+    description: "The report's Branch column, comma-joined. Filter through mart__bridge_client_workgroup."
+  - name: workgroup_names
+    dataType: "VARCHAR"
+    description: "The report's Workgroup column, comma-joined. Filter through mart__bridge_client_workgroup."
+  - name: area_id
+    dataType: "NUMBER(38,0)"
+    description: "The client's area id (client.area as a number); null when the client has no area. Branch-level RLS key for the TenantArea role (mart__area_scope), which hides a null under an area limit, as on the page."
+  - name: area_name
+    dataType: "VARCHAR"
+    description: "The report's Area column; null when no area row holds that id."
+  - name: email
+    dataType: "VARCHAR"
+    description: "The report's E-mail column."
+  - name: phone
+    dataType: "VARCHAR"
+    description: "The report's Phone column — home and mobile, blanks skipped."
+  - name: phone_home
+    dataType: "VARCHAR"
+    description: "Home phone; with phone_mobile, what the Phone search matches."
+  - name: phone_mobile
+    dataType: "VARCHAR"
+    description: "Mobile phone."
+  - name: date_of_birth
+    dataType: "DATE"
+    description: "The report's DOB column."
+  - name: job_types
+    dataType: "VARCHAR"
+    description: "The report's Job Type column, comma-joined. Filter through mart__bridge_client_job_type."
+  - name: tags
+    dataType: "VARCHAR"
+    description: "The report's Tags column, comma-joined in tag category order. Filter through mart__bridge_client_tag."
+  - name: status_id
+    dataType: "NUMBER(38,0)"
+    description: "Status key (client.statusId as a number)."
+  - name: status
+    dataType: "VARCHAR"
+    description: "The report's Status column (status.type)."
+  - name: status_colour
+    dataType: "VARCHAR"
+    description: "Status colour (status.colour), a Bootstrap 3 context class (info, danger, primary, success, warning), not a colour code. Map it before using it for conditional formatting."
+  - name: status_change_at
+    dataType: "TIMESTAMP_NTZ"
+    description: "The report's Status Change column — when the latest status change was recorded, as TIMESTAMP_NTZ (the value as loaded, without a time zone)."
+  - name: status_comment
+    dataType: "VARCHAR"
+    description: "The report's Comment column — the note of the latest status change."
+  - name: first_contact_date
+    dataType: "DATE"
+    description: "The report's first contact column (admissionDate); the legacy header is the company's own label."
+  - name: service_commenced_date
+    dataType: "DATE"
+    description: "The report's service commenced column (inductionDate); the legacy header is the company's own label."
+  - name: council_id
+    dataType: "VARCHAR"
+    description: "The report's Council Id column."
+  - name: state_id
+    dataType: "NUMBER(38,0)"
+    description: "Raw state code — 1 Active, 2 Pending, 3 Archived."
+  - name: state
+    dataType: "VARCHAR"
+    description: "The report's state — Active / Pending / Archived (the legacy tabs)."
+  - name: location_key
+    dataType: "NUMBER(38,0)"
+    description: "Relationship key to mart__dim_location — source_key(source, location_id)."
+    isForeignKey: true
+  - name: company_id
+    dataType: "NUMBER(38,0)"
+    description: "Company key (client.companyId). RLS key (with location_id)."
+  - name: location_id
+    dataType: "NUMBER(38,0)"
+    description: "Location key (client.location). RLS key (with company_id)."

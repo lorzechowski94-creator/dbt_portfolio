@@ -1,0 +1,57 @@
+name: mart__carer_hours_report
+schema: care_management
+description: Carer hours per carer per service date PER JOB TYPE, full history plus a 60-day forward look (macros/report_horizon.sql). Single fact ported from carersHoursRpt.php serving both the carer-level report and the jobtype slicer.
+grain: One row per carer_key + service_date + job_type_key
+modelRole: periodic-snapshot
+rationale:
+  purpose: Power BI sums over all job_type_id for the carer-level report, or filters job_type_id and relates to dim_jobtype for the jobtype view.
+  grainChoice: Scheduled/confirmed/worked split by recurr.jobType / timesheet.jobType; contracted has no jobType so it lands in a single NO_JOB_TYPE (-1) bucket per carer/date, which keeps the fact additive — summing all job types reconciles exactly to carer totals.
+  design: Incremental (delete+insert on service_date) - each run replaces every date from 60 days back up to the horizon, so a forecast row whose schedule or contract has since changed does not survive; older backfills need --full-refresh. Demographics live in mart__dim_carer.
+columns:
+  - name: source
+    dataType: VARCHAR
+    description: Tenant token of the source schema the row came from. Opens the grain, and part of every relationship to a dimension.
+    isNaturalKey: true
+  - name: service_date
+    dataType: DATE
+    description: Service date (scheduled occurrence / timesheet logDate / contract day). Grain with carer_id + job_type_id; relates to dim_date.
+    isNaturalKey: true
+    isForeignKey: true
+  - name: carer_key
+    dataType: NUMBER(38,0)
+    description: Power BI relationship key to dim_carer — source_key(source, carer_id). carer_id alone repeats across cares, so relating on the bare id would join one care's carer to another's.
+    isForeignKey: true
+    isNaturalKey: true
+  - name: job_type_key
+    dataType: NUMBER(38,0)
+    description: Power BI relationship key to dim_jobtype — source_key(source, job_type_id). The NO_JOB_TYPE bucket yields source_key(source, -1), which matches no dim_jobtype row and lands on the blank member.
+    isForeignKey: true
+    isNaturalKey: true
+  - name: scheduled_hrs
+    dataType: NUMBER(38,6)
+    description: Scheduled hours from recurr occurrences.
+    additiveType: additive
+  - name: confirmed_payable_hrs
+    dataType: NUMBER(38,6)
+    description: Confirmed payable time (timesheet.time) in hours.
+    additiveType: additive
+  - name: worked_hrs
+    dataType: NUMBER(38,6)
+    description: Actual worked duration (timesheet.duration) in hours.
+    additiveType: additive
+  - name: contracted_hrs
+    dataType: NUMBER(38,6)
+    description: Contracted hours from cmContractsHours — only on the NO_JOB_TYPE (-1) row per carer/date.
+    additiveType: additive
+  - name: over_under_contracted_hrs
+    dataType: NUMBER(38,6)
+    description: contracted_hrs - confirmed_payable_hrs per row; DAX subtracts the summed pillars.
+    additiveType: additive
+  - name: phone_admin_total_count
+    dataType: NUMBER(38,0)
+    description: Confirmed timesheets with dontPay IS NULL (phone-vs-admin denominator).
+    additiveType: additive
+  - name: carer_confirmed_count
+    dataType: NUMBER(38,0)
+    description: Carer-confirmed subset (phone-vs-admin numerator).
+    additiveType: additive

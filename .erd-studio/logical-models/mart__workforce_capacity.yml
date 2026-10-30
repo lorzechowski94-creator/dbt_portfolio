@@ -1,0 +1,63 @@
+name: mart__workforce_capacity
+schema: care_management
+description: The hours of the Workforce Capacity report — supply per carer per day and demand per location and client area per day, full history plus the three-month outlook up to the projection horizon (macros/projection_horizon.sql).
+grain: One row per location_key + area_id + carer_key + calendar_date
+modelRole: periodic-snapshot
+rationale:
+  purpose: Every hours card and chart of Workforce Capacity — staff contracted / available hours, customer contracted hours, unfilled capacity, utilisation, and the outlook's projected hours, headroom and estimated additional customers (DAX in docs/powerbi_workforce_capacity_measures.md).
+  grainChoice: Supply rows are one per carer at the carer's location and area; the demand columns sit on one row per location, client area and date with carer_key source_key(source, -1) (NO_CARER). The area (the person's current one) is in the grain for the embedded TenantArea role, and summed over areas every column gives the location total. As before, the -1 row is the NO_JOB_TYPE device of mart__carer_hours_report. Every column stays additive, and a per-carer measure iterating carer_key (unfilled capacity) finds 0 contracted and 0 scheduled on the demand row. Daily, not weekly, because the period selector is free — months and quarters do not align with ISO weeks.
+  design: Incremental (delete+insert on calendar_date) — each run replaces every date from 60 days back up to the projection horizon, so a forecast row whose rules have since changed does not survive. The outlook is a direct projection of roster rules, contracts and assigned hours as they stand, not a forecast. Staff pillars are clipped to the carer's employment spell and demand pillars to the client's service spell (int__carer_employment_spell / int__client_service_spell). No job type split — contracted and available hours carry none.
+  measures: All stored hours are additive and unrounded. hrs/week figures, ratios and the per-carer-per-week clip of unfilled capacity are DAX measures, because no stored column can express them for an arbitrary period.
+columns:
+  - name: source
+    dataType: VARCHAR
+    description: Tenant token of the source schema the row came from. Opens the grain.
+    isNaturalKey: true
+  - name: calendar_date
+    dataType: DATE
+    description: The day; past days are actuals, future days the outlook. Relates to dim_date.
+    isNaturalKey: true
+    isForeignKey: true
+  - name: company_id
+    dataType: NUMBER(38,0)
+    description: Company key, from the location. RLS key (with location_id).
+  - name: location_id
+    dataType: NUMBER(38,0)
+    description: Location key — the carer's for supply rows, the client's for the demand row. RLS key (with company_id).
+  - name: area_id
+    dataType: NUMBER(38,0)
+    description: "The area the hours belong to — the carer's on supply rows, the client's on the demand row; the person's current area. The key the embedded TenantArea role filters on; null where the source holds the area as free text."
+    isNaturalKey: true
+  - name: location_key
+    dataType: NUMBER(38,0)
+    description: Power BI relationship key to dim_location — source_key(source, location_id). The fact's tenant boundary.
+    isForeignKey: true
+    isNaturalKey: true
+  - name: carer_key
+    dataType: NUMBER(38,0)
+    description: source_key(source, carer_id); source_key(source, -1) (NO_CARER) on the location's demand row. dim_carer holds current carers only, so leavers land on its blank member.
+    isNaturalKey: true
+  - name: contracted_hrs
+    dataType: NUMBER(38,6)
+    description: Staff contracted hours (contract history, one contract per day, clipped to the employment spell). On future dates, the outlook's projected available hours.
+    additiveType: additive
+  - name: available_hrs
+    dataType: NUMBER(38,6)
+    description: Staff availability (overlapping windows merged). Feeds only the Available Hours card and chart line; 0 where a company records none.
+    additiveType: additive
+  - name: scheduled_hrs
+    dataType: NUMBER(38,6)
+    description: Roster hours booked to an active care worker — the utilisation numerator; reconciles with Carer Hours' Scheduled.
+    additiveType: additive
+  - name: unassigned_hrs
+    dataType: NUMBER(38,6)
+    description: Roster hours booked to no one. Demand row only.
+    additiveType: additive
+  - name: inactive_carer_hrs
+    dataType: NUMBER(38,6)
+    description: Roster hours still booked to a carer who is not an active care worker on the date. Demand row only.
+    additiveType: additive
+  - name: customer_contracted_hrs
+    dataType: NUMBER(38,6)
+    description: Customer contracted hours (cmAssignedHours, clipped to the client's service spell). Demand row only.
+    additiveType: additive

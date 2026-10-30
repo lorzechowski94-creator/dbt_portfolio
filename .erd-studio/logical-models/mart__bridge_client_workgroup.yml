@@ -1,0 +1,43 @@
+name: mart__bridge_client_workgroup
+schema: care_management
+description: "One row per client of mart__all_clients_report and each live workgroup / branch path of their area (int__area_workgroup_branch). The Branch and Workgroup slicers of the All Clients report."
+grain: "One row per source + client_id + workgroup_id + branch_id"
+modelRole: factless-fact
+rationale:
+  purpose: "An area can sit in several workgroups, so branch and workgroup are a bridge, not a column on the client row."
+  grainChoice: "Client grain, not area grain, as mart__bridge_carer_workgroup: the client table's RLS (TenantArea included) flows down the relationship, so a restricted admin's slicers list only their own branches, and all_clients_sv can count clients per branch on it."
+  design: "Power BI - bridge[client_key] *:1 all_clients[client_key] with cross-filter BOTH, slicers on branch_name and workgroup_name (blank branch left out of the Branch slicer). Every live workgroup of the area, with its live branch where it has one, as the page's filters match; a client whose area is in no live workgroup has no row."
+  roleChoice: "mart__area_scope keeps the links as ids for the TenantArea role and also keeps paths this bridge drops; it must not be swapped for this table."
+columns:
+  - name: source
+    dataType: "VARCHAR"
+    description: "Tenant token of the source schema the row came from. Opens the grain."
+    isNaturalKey: true
+  - name: client_id
+    dataType: "NUMBER(38,0)"
+    description: "Client key. Grain with source + workgroup_id + branch_id. Power BI relates on client_key."
+    isNaturalKey: true
+  - name: client_key
+    dataType: "NUMBER(38,0)"
+    description: "Relationship key to mart__all_clients_report — source_key(source, client_id)."
+    isForeignKey: true
+  - name: workgroup_id
+    dataType: "NUMBER(38,0)"
+    description: "Workgroup id (cmLevelAreaWorkgroup.workgroupId)."
+    isNaturalKey: true
+  - name: workgroup_name
+    dataType: "VARCHAR"
+    description: "Workgroup name (cmLevelWorkgroup.name) — the Workgroup slicer value."
+  - name: branch_id
+    dataType: "NUMBER(38,0)"
+    description: "Branch id (cmLevelWorkgroupBranch.branchId); null for a workgroup with no live branch."
+    isNaturalKey: true
+  - name: branch_name
+    dataType: "VARCHAR"
+    description: "Branch name (cmLevelBranch.name) — the Branch slicer value. Not the location."
+  - name: company_id
+    dataType: "NUMBER(38,0)"
+    description: "Company key, from the client. RLS key (with location_id)."
+  - name: location_id
+    dataType: "NUMBER(38,0)"
+    description: "Location key, from the client. RLS key (with company_id)."

@@ -1,0 +1,78 @@
+version: 2
+
+# ONE source block for every care. Which care a run reads is $DBT_CARE:
+# schema resolves to CARE1 / CARE2 / CARE3 / CARE4 / CARE5 / BETA / ALPHA / ALPHA2 (see
+# dbt_project.yml — the R3 account's tenant schemas are not named careN).
+# Each care is an independent MySQL database ingested into its own Snowflake
+# schema with the same table NAMES, so one definition serves them all.
+#
+# The COLUMNS are not identical, though this file used to claim they were. The
+# first account-wide build proved otherwise: care2/3/5 differ in column count on
+# `carer` (93 vs 94) and `client` (119 vs 118), and `jobtype` differs in column
+# ORDER, which put a number under a timestamp. That is why macros/union_cares.sql
+# aligns the cares by column NAME rather than selecting `s.*` — read its header
+# before assuming a care's table looks like its sibling's.
+#
+# The physical tables are the MySQL source names ingested to Snowflake as
+# UPPERCASE with no underscores (e.g. clientDetails -> CLIENTDETAILS). We keep
+# readable snake_case source names and map each multi-word one to its physical
+# table via `identifier`. Single-word tables need no identifier.
+#
+# Only the tables behind the sample raw_access models are declared here.
+
+sources:
+  - name: raw_app
+    database: ANALYTICS_RAW
+    schema: "{{ env_var('DBT_CARE', 'care1') | upper }}"
+    config:
+      freshness:
+        warn_after: {count: 24, period: hour}
+      loaded_at_field: updated
+    tables:
+      # --- Core entities (mutate; tracked via created/updated) ---
+      - name: client
+        columns:
+          - name: id
+            tests:
+              - unique
+              - not_null
+      - name: company
+        columns:
+          - name: id
+            tests:
+              - unique
+              - not_null
+      - name: location
+        config:
+          freshness: null
+        columns:
+          - name: id
+            tests:
+              - unique
+              - not_null
+      - name: timesheet
+        columns:
+          - name: id
+            tests:
+              - unique
+              - not_null
+
+      # --- Static lookups (reference data; no freshness expectation) ---
+      - name: status
+        description: Lookup of client state id -> label.
+        config:
+          freshness: null
+        columns:
+          - name: id
+            tests:
+              - unique
+              - not_null
+      - name: state
+        description: Global lookup of carer state id -> name (state 3 displayed as "Archived").
+        config:
+          freshness: null
+        columns:
+          - name: id
+            tests:
+              - unique
+              - not_null

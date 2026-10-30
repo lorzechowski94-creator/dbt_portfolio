@@ -1,0 +1,103 @@
+# SQLFluff config for the care_analytics dbt project (Snowflake).
+# Uses the dbt templater so Jinja ({{ source(...) }}, ref(...), macros) is
+# compiled before linting. The templater shells out to dbt compile, so it
+# needs a profile — locally it uses the root profiles.yml, in CI it picks up
+# DBT_PROFILES_DIR=ci automatically.
+
+[sqlfluff]
+# jinja templater (not dbt) so linting needs NO warehouse connection and NO
+# secrets — works identically locally and in CI. apply_dbt_builtins below stubs
+# source()/ref()/config()/var() so dbt Jinja resolves without compiling against
+# Snowflake. Switch to `templater = dbt` only if you need real macro expansion
+# (and then CI must have working Snowflake credentials).
+templater = jinja
+dialect = snowflake
+runaway_limit = 10
+max_line_length = 120
+# Rules we deliberately switch off:
+#   RF04 -> allows columns named like keywords (common in source data)
+#   ST06 -> don't enforce a fixed select-column ordering
+#   AM04 -> "select *" is fine in raw_access passthrough models
+exclude_rules = RF04, ST06, AM04
+
+[sqlfluff:indentation]
+indent_unit = space
+tab_space_size = 4
+
+# Stub dbt's Jinja functions (source, ref, config, var, ...) so models template
+# without a dbt compile / database connection. load_macros_from_path makes the
+# project's custom macros (time_to_hours, minutes_to_hhmm) resolve during linting.
+[sqlfluff:templater:jinja]
+apply_dbt_builtins = true
+load_macros_from_path = macros
+
+# union_cares is STUBBED here rather than loaded from macros/. Two things in this
+# templater make the real one unusable: macros loaded from files cannot call each
+# other across files (union_cares -> sources_in_account, generate_schema_name), and dbt's
+# return() is not stubbed at all. Neither is a problem for dbt itself.
+# The stub emits ONE union branch instead of one per care, which is all the linter
+# needs: it checks LAYOUT, and the real branches are generated, identical in shape
+# and never hand-edited. Keep its output shape — select / care literal as source / s.* /
+# from <name> as s — in step with macros/union_cares.sql.
+# customer_access_filter is stubbed for the same reason, one step removed: it is a
+# file macro that calls env_var, which this templater only has as the stub below,
+# and a file macro cannot see stubs — so without this every raw_acc__ and report__
+# model fails to template. `1 = 1` keeps the WHERE clause the models write around
+# it valid and lintable.
+# exclude_internal is stubbed for the third variant of the same reason: the real one
+# reads the source table's columns off the warehouse (adapter, execute, source()),
+# none of which this templater gives a file macro. The stub emits two representative
+# names — one from each class it drops — and one cast of the REPLACE it appends
+# (macros/mysql_types.sql), which is all the linter needs: it checks that
+# `select s.* exclude (...) replace (...)` parses in the snowflake dialect, and the real
+# lists are generated per relation and never hand-edited. Keep the SHAPE (star
+# modifiers, parenthesised lists of quoted upper-case names) in step with
+# macros/exclude_internal.sql.
+# source_code is stubbed because the real one reads source_codes() and all_sources(), which
+# hand their lists back with dbt's return(). The stub keeps the SHAPE, a simple CASE
+# over the source column, with one branch instead of one per care; keep it in step with
+# macros/source_topology.sql. source_key is stubbed because it calls source_code from
+# another file; its stub inlines that CASE and keeps the arithmetic of
+# macros/source_key.sql.
+[sqlfluff:templater:jinja:macros]
+exclude_internal = {% macro exclude_internal(bare) %}exclude ("_AIRBYTE_RAW_ID", "PASSWORD") replace (cast("ID" as number(10,0)) as "ID"){% endmacro %}
+union_cares = {% macro union_cares(bare, layer) %}select 'care1' as source, s.* from {{ bare }} as s{% endmacro %}
+# union_cares_present and cares_present_sql (macros/union_cares_present.sql) are
+# stubbed for union_cares' reasons: they look relations up on the warehouse and
+# return() a list between them. Same output shape as union_cares' stub; the
+# predicate stub keeps the SQL form `<col> in (...)`.
+union_cares_present = {% macro union_cares_present(bare, layer, columns, optional=[]) %}select 'care1' as source, s.* from {{ bare }} as s{% endmacro %}
+cares_present_sql = {% macro cares_present_sql(bare, layer, source_col='source') %}{{ source_col }} in ('care1'){% endmacro %}
+customer_access_filter = {% macro customer_access_filter(company_col='s.companyid', location_col='s.locationid', source_col=none, shared_company_id=none) %}1 = 1{% endmacro %}
+source_code = {% macro source_code(source_col) %}case {{ source_col }} when 'care1' then 1 end{% endmacro %}
+source_key = {% macro source_key(source_col, id_col) %}(case {{ source_col }} when 'care1' then 1 end * 1000000000000 + {{ id_col }}::int)::bigint{% endmacro %}
+# apply_dbt_builtins stubs source/ref/config/var but NOT env_var. No model calls it
+# directly today (models/sources.yml does, and that is not linted), but a model that
+# does would otherwise fail to template with no useful message. Renders the default,
+# which is the same care dbt_project.yml falls back to.
+env_var = {% macro env_var(name, default='') %}{{ default }}{% endmacro %}
+
+# Keyword / function casing -> lower (matches existing models: `select`, `from`)
+[sqlfluff:rules:capitalisation.keywords]
+capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.functions]
+extended_capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.identifiers]
+extended_capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.literals]
+capitalisation_policy = lower
+
+# Require explicit AS for column and table aliases
+[sqlfluff:rules:aliasing.column]
+aliasing = explicit
+
+[sqlfluff:rules:aliasing.table]
+aliasing = explicit
+
+# Trailing commas
+[sqlfluff:layout:type:comma]
+spacing_before = touch
+line_position = trailing

@@ -1,0 +1,36 @@
+name: mart__dim_jobtype
+schema: care_management
+description: One row per job type (id -> name). Provides the JobType column and slicer for the hours facts and the schedule difference fact.
+grain: One row per source + job_type_id
+modelRole: conformed-dim
+rationale:
+  roleChoice: Conformed dimension — three facts and the bridge relate to it on job_type_key.
+  design: The facts' -1 ("no job type") bucket has no row here on purpose; source_key(source, -1) matches nothing and lands on the Power BI blank member, exactly as the bare -1 did.
+columns:
+  - name: source
+    dataType: VARCHAR
+    description: Tenant token of the source schema the row came from. Opens the grain.
+    isNaturalKey: true
+    scdType: 0
+  - name: job_type_id
+    dataType: NUMBER(38,0)
+    description: Job type primary key (jobtype.id). Grain WITH source — the id is allocated per care and repeats across them.
+    isNaturalKey: true
+    scdType: 0
+  - name: job_type_key
+    dataType: NUMBER(38,0)
+    description: Power BI relationship key — source_key(source, job_type_id). The "one" side of every relationship into this dimension.
+    isPrimaryKey: true
+    scdType: 0
+  - name: job_type_name
+    dataType: VARCHAR
+    description: Job type display name (jobtype.name).
+    scdType: 1
+  - name: company_id
+    dataType: NUMBER(38,0)
+    description: Company key (jobtype.companyId). RLS key (with location_id).
+    scdType: 1
+  - name: location_id
+    dataType: NUMBER(38,0)
+    description: Location key (jobtype.locationId). RLS key (with company_id).
+    scdType: 1

@@ -1,0 +1,65 @@
+name: mart__dim_location
+schema: care_management
+description: One row per location — the branch a carer, client or visit belongs to. The Branch slicer of the Workforce Capacity report and the tenant boundary of its two facts.
+grain: One row per source + location_id
+modelRole: conformed-dim
+rationale:
+  purpose: Names the location key every Workforce Capacity row carries, and gives a Power BI RLS role one table to filter that reaches both facts.
+  roleChoice: Conformed dimension — nothing in it is specific to one report, so any fact with a location can relate here.
+  design: is_deleted is a lifecycle marker only; a soft-deleted location still owns its history and is never an access filter (macros/customer_access_filter.sql).
+columns:
+  - name: source
+    dataType: VARCHAR
+    description: Tenant token of the source schema the row came from. Opens the grain.
+    isNaturalKey: true
+    scdType: 0
+  - name: location_id
+    dataType: NUMBER(38,0)
+    description: Location primary key (location.id). Grain WITH source — the id repeats across cares.
+    isNaturalKey: true
+    scdType: 0
+  - name: location_key
+    dataType: NUMBER(38,0)
+    description: Power BI relationship key — source_key(source, location_id). The "one" side of both Workforce Capacity relationships.
+    isPrimaryKey: true
+    scdType: 0
+  - name: location_name
+    dataType: VARCHAR
+    description: Location name — the Branch slicer label.
+    scdType: 1
+  - name: company_id
+    dataType: NUMBER(38,0)
+    description: Company key (location.companyId). RLS key (with location_id); the facts take their company_id from here.
+    scdType: 1
+  - name: address
+    dataType: VARCHAR
+    description: First address line (location.address1).
+    scdType: 1
+  - name: town
+    dataType: VARCHAR
+    description: Town.
+    scdType: 1
+  - name: county
+    dataType: VARCHAR
+    description: County.
+    scdType: 1
+  - name: post_code
+    dataType: VARCHAR
+    description: Postcode.
+    scdType: 1
+  - name: country
+    dataType: VARCHAR
+    description: Country.
+    scdType: 1
+  - name: created_date
+    dataType: DATE
+    description: Date the location was created.
+    scdType: 0
+  - name: deleted_date
+    dataType: DATE
+    description: Date the location was soft-deleted; null while live.
+    scdType: 1
+  - name: is_deleted
+    dataType: BOOLEAN
+    description: True once soft-deleted. Lifecycle marker only — never an access filter.
+    scdType: 1

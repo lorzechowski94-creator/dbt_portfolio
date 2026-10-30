@@ -1,0 +1,32 @@
+name: mart__area_scope
+schema: care_management
+description: "Area <-> workgroup <-> branch, one row per link, ids only. The table behind the TenantArea role of the embedded Power BI models."
+grain: One row per source + area_id + workgroup_id + branch_id
+modelRole: reference
+rationale:
+  purpose: "Lets a Power BI role turn the branch and workgroup ids of a restricted admin (cmLevelAccess, carried in the embed token's customData) into the areas whose rows the admin may see. The legacy reports apply the restriction as area IN (...), with the areas of the admin's workgroup list; the branch list counts only when no workgroup was picked, and then supplies the workgroups of those branches (getAccessList())."
+  design: "The admin's area list is too long for an embed token (over 1,000 characters for some admins), while the branch and workgroup ids fit. So the token carries the ids and the role applies the legacy rule through this table. An area with no workgroup link never reaches a restricted admin, although carers and clients can sit on it, as in the legacy list. Loaded hidden, with no relationships; it holds no names, so it needs no RLS rule of its own."
+  grainChoice: "One row per link, because an area can sit in several workgroups. A workgroup belongs to one branch at most; branch_id is null for a workgroup that belongs to no branch."
+columns:
+  - name: source
+    dataType: VARCHAR
+    description: Tenant token of the source schema the row came from. Opens the grain.
+    isNaturalKey: true
+  - name: company_id
+    dataType: NUMBER(38,0)
+    description: "Company key (cmLevelAreaWorkgroup.companyId). The role matches it with the token's company."
+  - name: location_id
+    dataType: NUMBER(38,0)
+    description: Location key (cmLevelAreaWorkgroup.locationId).
+  - name: area_id
+    dataType: NUMBER(38,0)
+    description: "Area id (cmLevelAreaWorkgroup.areaId). What the role hands to the area_id column of the report's tables."
+    isNaturalKey: true
+  - name: workgroup_id
+    dataType: NUMBER(38,0)
+    description: "Workgroup id (cmLevelAreaWorkgroup.workgroupId). Matched against the token's workgroup list."
+    isNaturalKey: true
+  - name: branch_id
+    dataType: NUMBER(38,0)
+    description: "Branch id (cmLevelWorkgroupBranch.branchId). Matched against the token's branch list, which counts only when the workgroup list is empty; null when the workgroup belongs to no branch."
+    isNaturalKey: true

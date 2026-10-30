@@ -1,0 +1,1972 @@
+version: 2
+
+# THIS LAYER IS THE SEAM, AND EVERY MODEL IN IT IS ACCOUNT-WIDE.
+# raw_access and staging are built ONCE PER CARE, each into that care's own
+# schema. From here up there is one relation per ACCOUNT: these models read
+# every care's staging at once (macros/union_cares.sql) and carry the care as a
+# COLUMN. That is also why the build has two phases — see dbt_project.yml.
+#
+# Two consequences that nothing in dbt enforces:
+#   * Every join and every window PARTITION BY needs the care alongside the id.
+#     Client, carer, area, job type, recurr and location ids are all allocated per
+#     care and collide across them, so `a.id = b.id` alone fans each row out
+#     against another tenant's rows. It does not error; the numbers just come out
+#     multiplied, or a qualify picks the wrong row.
+#   * Every grain below opens with `source`.
+#
+# int__report_calendar is the one exception: a generated date spine with no tenant
+# in it, so it has no source column and joins to it need no source condition.
+models:
+  - name: int__area_hierarchy
+    description: >
+      Area -> workgroup(s) -> branch(es) hierarchy, one row per area. Workgroup
+      and branch names are de-duplicated and comma-joined (an area can map to
+      several of each). Ports query #7 of the client hours report.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, area_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests:
+          - not_null
+      - name: area_id
+        description: >
+          Area key (cm_level_area_workgroup.areaid). Grain of the model WITH source
+          — the id is allocated per care and repeats across them.
+        tests:
+          - not_null
+      - name: workgroup_names
+        description: Comma-joined distinct workgroup names for the area.
+      - name: branch_names
+        description: Comma-joined distinct branch names for the area.
+
+  - name: int__client_information
+    description: >
+      Client Information dimension — one row per client with demographics,
+      billing, area/workgroup/branch and funder / care manager / consultant
+      contacts plus referral and status lookups. Ports the main client query and
+      getClientDetails().
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, client_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests:
+          - not_null
+      - name: client_id
+        description: >
+          Client primary key (client.id). Grain of the model WITH source — the id is
+          allocated per care and repeats across them.
+        tests:
+          - not_null
+      - name: client_no
+        description: Front-end client identifier (residentId).
+      - name: full_name
+        description: First name and surname concatenated.
+      - name: area_id
+        description: >
+          Area id (client.area as a number; null where the source holds free text).
+          Branch-level RLS key, carried to mart__dim_client.
+      - name: area_name
+        description: Area the client belongs to (area.name via client.area).
+      - name: workgroup
+        description: Comma-joined workgroup name(s) for the client's area.
+      - name: branch
+        description: Comma-joined branch name(s) for the client's area.
+      - name: cso
+        description: CSO — same value as billing_code (clientDetails.billingCode).
+      - name: billing_code
+        description: Billing code (clientDetails.billingCode).
+      - name: referral_reason
+        description: Referral reason name (referralReason lookup).
+      - name: care_manager
+        description: Care Manager full name (contacts typeId = 10).
+      - name: funder
+        description: Funder full name (contacts typeId = 8).
+      - name: consultant
+        description: Consultant full name (contacts typeId = 32).
+      - name: state_id
+        description: Client state id (1 = active, 2 = pending, 3 = inactive).
+      - name: status_label
+        description: Client state label (status lookup).
+
+  - name: int__client_delivered_hours
+    description: >
+      "Delivered" pillar — confirmed timesheet measures aggregated per client per
+      service date (timeConfirmed = 'Yes' only). Raw components; the mart derives
+      total_confirmed_billed = confirmed_payable_hrs - cancelled_not_billed_hrs.
+    columns:
+      - name: client_id
+        description: Client key (timesheet.clientid).
+      - name: location_id
+        description: Location key (timesheet.locationid).
+      - name: job_type_id
+        description: Job type key (timesheet.jobType). Part of the grain; lets the jobtype mart split per job type.
+      - name: service_date
+        description: Service date (timesheet.logdate). Part of the grain.
+      - name: confirmed_payable_hrs
+        description: All confirmed payable time (any type), from payableTime.
+      - name: cancelled_timesheet_billed_hrs
+        description: payableTime where timeType = 'Cancelled' and dontBill = 0.
+      - name: cancelled_timesheet_not_billed_hrs
+        description: payableTime where timeType = 'Cancelled' and dontBill = 1.
+      - name: total_actual_time_hrs
+        description: Clock duration where timeType IS NULL (cancellations excluded).
+      - name: confirmed_breaks_paid_hrs
+        description: tea minutes where teaPay = 1, in hours.
+      - name: confirmed_breaks_unpaid_hrs
+        description: tea minutes where teaPay = 0, in hours.
+
+  - name: int__client_carer_visits
+    description: >
+      Delivered visit counts per client per carer per service date — the grain
+      behind the Continuity of Care report. Only timeType IS NULL rows (actual
+      visits); unlike the hours pillars this report does NOT gate on
+      timeConfirmed, matching the legacy queries. Keeping the carer on the row is
+      what lets the mart's non-additive COUNT(DISTINCT carerId) be evaluated
+      downstream against whatever date range the user picks.
+    columns:
+      - name: client_id
+        description: Client key (timesheet.clientid). Part of the grain.
+      - name: location_id
+        description: Location key (timesheet.locationid). Part of the grain; the mart rolls up over it.
+      - name: carer_id
+        description: Carer key (timesheet.carerid). Part of the grain — the distinct-count dimension.
+      - name: service_date
+        description: Service date (timesheet.logdate). Part of the grain.
+      - name: visit_count
+        description: COUNT of delivered timesheet rows — the report's "Visits" figure and the continuity denominator.
+
+  - name: int__report_calendar
+    description: >
+      One row per calendar date from a fixed early anchor up to the projection
+      horizon, the end of the third whole month from today
+      (macros/projection_horizon.sql). Drives the set-based recurrence
+      expansion. The hours reports' pillars built on it clamp themselves to their
+      own today + 60 (macros/report_horizon.sql); the Workforce Capacity pillars
+      run to the end.
+    columns:
+      - name: calendar_date
+        description: A single date in the report window.
+        tests:
+          - unique
+          - not_null
+
+  - name: int__recurr_occurrences
+    description: >
+      Each recurr template expanded into individual occurrence dates within the
+      report window, up to the projection horizon (macros/projection_horizon.sql)
+      — set-based port of returnDates() (weekly / fortnightly / monthly patterns,
+      no-show removal, bank-holiday removal). The three hours-report consumers
+      (int__carer_scheduled_hours, int__client_scheduled_hours,
+      int__schedule_difference) cap it at today + 60; int__workforce_scheduled_hours
+      reads it to the end for the capacity outlook. Incremental (delete+insert on
+      occurrence_date): each run replaces every date from 7 days back up to the
+      horizon, so a forecast occurrence whose template has since changed does not
+      survive.
+    columns:
+      - name: recurr_id
+        description: Source recurr id.
+      - name: job_type_id
+        description: Job type key (recurr.jobType). Carried through for the jobtype mart.
+      - name: occurrence_date
+        description: A single expanded occurrence date. With recurr_id forms the grain.
+      - name: event_minutes
+        description: Duration of the occurrence in minutes (from recurr.hours).
+      - name: paid_break_minutes
+        description: Break minutes when teaPay = 1, else 0.
+      - name: unpaid_break_minutes
+        description: Break minutes when teaPay <> 1, else 0.
+      - name: is_unassigned
+        description: True when carerId = 0 and statusId = 1.
+      - name: is_no_show
+        description: True when the occurrence date is in recurr.dateNoShow (carer did not attend). Excluded from Total Scheduled; feeds the Non-Delivered pillar.
+
+  - name: int__client_non_delivered_hours
+    description: >
+      "Non-delivered incl. cancelled" pillar — scheduled calls the carer did not
+      attend, from statusChangeEventsRemoved (all removed events in the window,
+      eventMinutes / 60). Split by job type: the source carries a jobType column
+      that the legacy PHP ignored, keeping the figure client-level. The mart
+      derives the excl-cancelled figure by subtracting the timesheet cancellations.
+    columns:
+      - name: client_id
+        description: Client key.
+      - name: location_id
+        description: Location key.
+      - name: job_type_id
+        description: >
+          Job type key (statusChangeEventsRemoved.jobType). Part of the grain.
+          NULL where the source never recorded one - the jobtype mart folds
+          those into its NO_JOB_TYPE (-1) bucket.
+      - name: non_delivered_incl_cancelled_hrs
+        description: Sum of eventMinutes / 60 for all removed events in the window.
+
+  - name: int__client_scheduled_hours
+    description: >
+      "Scheduled" pillar — recurr occurrences aggregated per client. Raw
+      components; the mart derives Total Scheduled, Unassigned and the scheduled
+      break figures.
+    columns:
+      - name: client_id
+        description: Client key.
+      - name: location_id
+        description: Location key.
+      - name: job_type_id
+        description: Job type key (recurr.jobType). Part of the grain; lets the jobtype mart split per job type.
+      - name: scheduled_event_hrs_all
+        description: All occurrence event hours.
+      - name: scheduled_event_hrs_unassigned
+        description: Occurrence event hours for unassigned events (carerId = 0, statusId = 1).
+
+  - name: int__client_allocated_hours
+    description: >
+      "Contracted/allocated" pillar — cmAssignedHours expanded over the report
+      window and summed. Set-based port of getAllocatedHrs(). Runs to the
+      projection horizon (macros/projection_horizon.sql) because it is also the
+      customer contracted hours of Workforce Capacity; mart__client_hours_report
+      caps it at its own today + 60.
+    columns:
+      - name: client_id
+        description: Client key.
+      - name: location_id
+        description: Location key.
+      - name: job_type_id
+        description: Job type key (cmAssignedHours.jobType). Part of the grain; lets the jobtype mart split per job type.
+      - name: allocated_hrs
+        description: Contracted hours in the window (occurrences x length / 60).
+
+  - name: int__carer_qualifications
+    description: >
+      Carer Qualification Export — one row per carer × qualification record. Ports
+      carerQualificationExport.php (carer list, qualifications per carer, modified-by
+      and state name lookups). Keeps carers only (permissionId = 4); carer.deleted is
+      not filtered; q.deleted IS NULL drops deleted qualification records while the
+      qualification-type deleted flag is retained for the red-highlight display.
+      Carries qualification_type_id as the HR File key; the category -> HR File Type
+      label is defined once, in mart__dim_hrfile.
+    columns:
+      - name: carer_id
+        description: Carer primary key (carer.id). With the qualification record forms the grain.
+        tests:
+          - not_null
+      - name: carer_no
+        description: Front-end carer display id (carer.carerId).
+      - name: qualification_record_id
+        description: >
+          The qualification record itself (cmQualifications.id); null on the row a
+          carer with no qualifications produces. Count FILES on this column — a row
+          count would include those no-record rows.
+      - name: qualification_type_id
+        description: >
+          HR file / qualification type key (cmQualifications.qualificationId) — the
+          "HR File" filter key, relates to mart__dim_hrfile. -1 when the carer holds
+          no qualification record at all.
+        tests:
+          - not_null
+      - name: qualification_name
+        description: Qualification type name (cmQualificationsType.name).
+      - name: is_type_deleted
+        description: >
+          True when the company has retired this HR file type
+          (cmQualificationsType.deleted is set); false while it is still in use.
+          Boolean, never null. Retired types are marked, never filtered out — audit
+          lookbacks need the history. Shown in red by the front end.
+      - name: awarded
+        description: Award date (cmQualifications.awardDate); zero-dates land as null.
+      - name: expired
+        description: Expiry date (cmQualifications.expireDate); zero-dates land as null.
+      - name: expire_status
+        description: >
+          The file's status — 'not_actioned' (neither date filled), 'expired'
+          (expireDate <= today, so a file expiring TODAY is expired) or 'valid'
+          (expires after today, or an award with no expiry). Three mutually
+          exclusive values covering every record; null when the carer holds no
+          record at all. ONE column for both reports: the flat export searches it
+          as a keyword, and the compliance dashboard's valid/not-actioned/expired
+          split comes straight from it.
+        tests:
+          # nulls pass this test, which is what the no-record rows need
+          - accepted_values:
+              arguments:
+                values: ['valid', 'not_actioned', 'expired']
+      - name: days_to_expiry
+        description: >
+          Whole days from the build date to expireDate — 0 means it expires today
+          (and is therefore already 'expired'), negative means overdue, null when
+          there is no expiry. Feeds "Days Overdue" / "Days Remaining". As-of the
+          build, not the query: it is only correct while the daily refresh runs.
+      - name: is_expiring
+        description: >
+          True when the file is still valid but within its own type's alert window
+          (cmQualificationsType.alertBefore — text such as '4 week' or '1 month',
+          read as a calendar interval by macros/alert_before.sql). The window runs
+          from the expiry date minus that interval to the day before expiry — the
+          expiry date itself counts as expired. As-of the build, like
+          days_to_expiry. An OVERLAY on
+          expire_status = 'valid', not a fourth state — do not add it to a
+          valid/expired total or rows get counted twice. False when the type
+          configures no window.
+      - name: is_renewal
+        description: >
+          True when cmQualifications.multiple = 1, i.e. the record replaced an
+          earlier file. Combined with awarded it gives the "renewed" counts; the
+          window (last 30 days vs calendar month) is a report-side choice.
+      - name: state
+        description: Carer state name (state.name via carer.state); state 3 shown as 'Archived'.
+      - name: state_id
+        description: >
+          Raw carer state code behind that label (1 active, 2 pending,
+          3 archived). Exposed so report filters can slice on the code rather than
+          the display name — the compliance dashboard counts active/pending carers
+          only (state_id in (1, 2)).
+      - name: modified_by
+        description: Full name of the carer who last modified the record (carer lookup by cmQualifications.modifiedBy).
+      - name: file_uploaded
+        description: '"Yes" if a file exists (cmMultipleQualifications rows or legacy fileName), else "No".'
+      - name: company_id
+        description: Company key (carer.companyId). RLS key (with location_id).
+      - name: location_id
+        description: Location key (carer.location). RLS key (with company_id).
+
+  - name: int__schedule_difference
+    description: >
+      Schedule Difference Report — one row per individual scheduled call
+      occurrence, comparing the scheduled template against the matched timesheet
+      (early/late, worked vs scheduled, timesheet status, cancellation info).
+      Ports scheduleReport_diff.php. Reuses int__recurr_occurrences for
+      date expansion; keeps statusId IN (1, 2) (active + cancelled),
+      confirmSch = 'Yes', and carers in state IN (1, 2).
+    columns:
+      - name: recurr_id
+        description: Source recurr id. With occurrence_date forms the grain.
+        tests:
+          - not_null
+      - name: occurrence_date
+        description: The individual expanded call date. Part of the grain.
+        tests:
+          - not_null
+      - name: status_id
+        description: recurr.statusId (1 = active, 2 = cancelled). Cancellation columns populate only when 2.
+      - name: client_id
+        description: >
+          Client key (real client.id — NOT the residentId this column used to hold).
+          Name, area, workgroup, branch, council_id and the display id all come from
+          mart__dim_client.
+        tests:
+          - not_null
+      - name: carer_id
+        description: Carer key (carer.id); the name comes from mart__dim_carer. 1:1 with recurr_id.
+        tests:
+          - not_null
+      - name: job_type_id
+        description: >
+          Job type key (recurr.jobType); the name comes from mart__dim_jobtype. -1
+          when the source recorded none.
+        tests:
+          - not_null
+      - name: schedule_start
+        description: Scheduled start time "HH:MM" (recurr.timeStart).
+      - name: schedule_finish
+        description: Scheduled finish time "HH:MM" (recurr.timeFinish); '00:00' shown as '24:00'.
+      - name: clocked_in
+        description: Actual clock-in "HH:MM" (timesheet.logIn); empty if no timesheet or still clocked in.
+      - name: clocked_out
+        description: Actual clock-out "HH:MM" (timesheet.logOut); '00:00' -> '24:00'; empty if no timesheet or status='In'.
+      - name: early_late_minutes
+        description: >
+          Actual logIn - scheduled start in minutes (+ = late, - = early); NULL if no
+          timesheet. Kept alongside early_late because it sorts numerically and the
+          Power BI On Time % / Avg Early-Late measures aggregate it.
+      - name: early_late
+        description: >
+          Legacy display string for early_late_minutes: 'On time' / '+15' /
+          '- 10' (space after the minus, as the source report emits); NULL if no
+          timesheet.
+      - name: scheduled_time
+        description: Scheduled event duration "HH:MM" (recurr.hours).
+      - name: worked_time
+        description: Actual worked duration "HH:MM" (timesheet.duration); empty if no timesheet or status='In'.
+      - name: time_diff_minutes
+        description: Worked - scheduled duration in minutes (+ = over, - = under); NULL if no timesheet.
+      - name: cancellation_reason
+        description: Cancellation reason (reasonCancel.reason); only when status_id = 2.
+      - name: cancellation_comment
+        description: Cancellation comment (recurrCancel.comment); only when status_id = 2.
+      - name: timesheet_status
+        description: Confirmed / Submitted / None (see report §4.4).
+      - name: system_comments
+        description: timesheet.comment — usually empty; non-empty = admin-generated note.
+      - name: company_id
+        description: Company key (client.companyId). RLS key (with location_id).
+      - name: location_id
+        description: Location key (client.location). RLS key (with company_id).
+
+  - name: int__carer_scheduled_hours
+    description: >
+      "Scheduled" pillar of the carer hours report — recurr occurrences (via
+      int__recurr_occurrences) aggregated per carer per occurrence date.
+      Assigned, active, non-no-show templates only (carerId <> 0, statusId = 1).
+    columns:
+      - name: carer_id
+        description: Carer key (recurr.carerId).
+      - name: location_id
+        description: Location key (recurr.locationId).
+      - name: job_type_id
+        description: Job type key (recurr.jobType); preserved for a per-jobtype mart.
+      - name: service_date
+        description: Occurrence (event) date. Grain with carer_id + location_id + job_type_id.
+      - name: scheduled_hrs
+        description: Scheduled event hours (sum of event minutes / 60).
+
+  - name: int__carer_confirmed_hours
+    description: >
+      "Confirmed / worked" pillar of the carer hours report — confirmed timesheet
+      measures per carer per service date (logDate). timeConfirmed = 'Yes' only.
+    columns:
+      - name: carer_id
+        description: Carer key (timesheet.carerId).
+      - name: location_id
+        description: Location key (timesheet.locationId).
+      - name: job_type_id
+        description: Job type key (timesheet.jobType); preserved for a per-jobtype mart.
+      - name: service_date
+        description: Timesheet log date. Grain with carer_id + location_id + job_type_id.
+      - name: confirmed_payable_hrs
+        description: Payable time (timesheet.time) in decimal hours.
+      - name: worked_hrs
+        description: Actual elapsed duration (timesheet.duration) in decimal hours.
+      - name: phone_admin_total_count
+        description: Confirmed timesheets with dontPay IS NULL (denominator of phone-vs-admin %).
+      - name: carer_confirmed_count
+        description: Of those, rows confirmed by carer (empty / Auto Clock In / Auto Clock Out comment).
+
+  - name: int__carer_contracted_hours
+    description: >
+      "Contracted" pillar of the carer hours report — cmContractsHours weekday
+      minutes attributed per calendar day (set-based port of the PHP weekday
+      counting). Current active contracts only (deleted IS NULL, archiveId = 1).
+    columns:
+      - name: carer_id
+        description: Carer key (cmContractsHours.carerId).
+      - name: location_id
+        description: Location key (cmContractsHours.locationId).
+      - name: service_date
+        description: Calendar date within the contract range. Grain with carer_id + location_id.
+      - name: contracted_hrs
+        description: Contracted hours for that weekday (mon..sun minutes / 60).
+
+  - name: int__birthday_people
+    description: >
+      Birthday report source — one row per person (client or carer) whose date of
+      birth is usable, with the anniversary maths already applied. Ports
+      birthday.php: client leg UNION ALL carer leg (permissionId = 4), state
+      limited to Active/Pending/Archived, area name resolved once per area
+      instead of the PHP's per-row lookup. The PHP's dateFrom/dateTo window is
+      NOT applied — Power BI filters next_birthday_date, which is why the window
+      wraps across 31 December instead of returning zero rows the way the
+      'MM-DD' string comparison in the source does. The viewArea filter (the
+      logged-in admin's own branch/workgroup restriction) is not applied in the
+      build either: each row carries area_id instead, and the TenantArea role of
+      the embedded model applies the restriction at query time (mart__area_scope).
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, person_key]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: person_key
+        description: >
+          Surrogate key — care, person type and id packed into one integer:
+          source_code * 10^13 + (1 client, 2 carer) * 10^12 + person_id, with source_code
+          from macros/source_topology.sql. The type digit separates a client from a
+          carer of the same id and the care code separates cares, so the key is
+          unique on its own (it used to be the string 'client-123', unique only with
+          care). It is not a source_key: the extra type digit needs its own layout.
+        tests: [not_null, unique]
+      - name: person_type
+        description: "'client' or 'carer' — which table the row came from."
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['client', 'carer']
+      - name: person_id
+        description: client.id or carer.id. Not unique on its own.
+        tests: [not_null]
+      - name: person_type_label
+        description: Display form of person_type — Client / Carer.
+      - name: title
+        description: Salutation (client.title / carer.title); often blank.
+      - name: first_name
+        description: First name (fname).
+      - name: surname
+        description: Surname (sname).
+      - name: full_name
+        description: Title + first name + surname, trimmed so a blank title leaves no leading space.
+      - name: date_of_birth
+        description: >
+          Date of birth (dob). Bounded to 1900-01-01 .. today — the source holds
+          birth years 0001, 0137 and 6414 plus future dates, all of which the PHP
+          renders as-is.
+        tests: [not_null]
+      - name: birth_month
+        description: Month of birth (1-12). Stable slicer column.
+      - name: birth_day
+        description: Day of month of birth (1-31). Stable slicer column.
+      - name: birthday_this_year
+        description: >
+          Anniversary inside the current calendar year; may already be in the
+          past. Filter on this for a window that looks backwards.
+      - name: next_birthday_date
+        description: >
+          Next anniversary on or after today — the report's date filter. A
+          29 February birthday clamps to 28 February in a non-leap year (dateadd
+          clamps to month end) rather than yielding NULL as the source does.
+      - name: days_to_go
+        description: Days from today to next_birthday_date; 0 = today. Never negative.
+      - name: days_to_go_label
+        description: >
+          Display text for days_to_go — 'Happy Birthday!' / '1 day until
+          birthday' / 'N days until birthday'. The source's '... days since
+          Birthday' variants cannot arise here because next_birthday_date is
+          never in the past.
+      - name: age_years
+        description: >
+          Age as at the build date, not as at the upcoming birthday — someone
+          3 days from turning 65 shows 64, matching MySQL TIMESTAMPDIFF(YEAR, ...).
+      - name: age_at_next_birthday
+        description: Age the person reaches on next_birthday_date. The figure age_years is usually misread as.
+      - name: gender
+        description: Gender (client.sex / carer.sex), free text in the source.
+      - name: email
+        description: Email address; blank/whitespace normalised to null.
+      - name: area_id
+        description: >
+          The person's own area id (client.area / carer.area as a number; null
+          where the source holds free text). Branch-level RLS key.
+      - name: area_name
+        description: >
+          Area name (area.name via client.area / carer.area), falling back to that
+          raw area id when the area is unmapped.
+      - name: workgroup
+        description: Comma-joined workgroup names for the area (int__area_hierarchy).
+      - name: branch
+        description: Comma-joined branch names for the area (int__area_hierarchy).
+      - name: state_id
+        description: Raw state code — 1 Active, 2 Pending, 3 Archived. Rows outside 1-3 are excluded.
+      - name: state
+        description: >
+          State label. Hardcoded 1/2/3 -> Active/Pending/Archived because the PHP
+          maps it in code rather than joining the state lookup.
+      - name: company_id
+        description: Company key (companyId). RLS key (with location_id).
+      - name: location_id
+        description: Location key (location). RLS key (with company_id).
+
+  - name: int__carer_anniversaries
+    description: >
+      Anniversary report source — one row per carer whose employment start date
+      is usable, with the work-anniversary maths already applied. Ports
+      anniversary.php: getAllCarers() (permissionId = 4, state limited to
+      Active/Pending/Archived), area name resolved once per area instead of the
+      PHP's per-row lookup. carer.deleted is not filtered — the source's filter
+      list has no such condition, and neither does the carer leg of
+      int__birthday_people. The PHP's dateFrom/dateTo window is NOT applied —
+      Power BI filters next_anniversary_date, which is why the window wraps
+      across 31 December instead of returning zero rows the way the 'MM-DD'
+      string comparison in the source does. The viewArea filter is not applied in
+      the build either: it is the logged-in admin's own area restriction, a
+      session property with no equivalent in a batch build, so the list is
+      company/location-wide. Each row carries area_id instead, and the TenantArea
+      role of the embedded model applies the restriction at query time
+      (mart__area_scope).
+      Start dates after the build date are dropped rather than listed: the PHP
+      lists a carer who has not started yet whenever the day and month of the
+      start date fall in the window, with 0 (or negative) Years Active.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, carer_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: carer_id
+        description: >
+          Carer primary key (carer.id). Grain of the model WITH source — the id is
+          allocated per care and repeats across them.
+        tests: [not_null]
+      - name: carer_key
+        description: >
+          source_key(source, carer_id) (macros/source_key.sql) — the one column that
+          identifies a row across the account. Same value as mart__dim_carer's key
+          for the same carer.
+        tests: [not_null]
+      - name: title
+        description: Salutation (carer.title); often blank.
+      - name: first_name
+        description: First name (fname).
+      - name: surname
+        description: Surname (sname).
+      - name: full_name
+        description: Title + first name + surname, trimmed so a blank title leaves no leading space.
+      - name: start_date
+        description: >
+          Employment start date (carer.startDate). Bounded to 1900-01-01 .. today:
+          a start date still to come has no anniversary yet, and implausible years
+          are unusable, so both are dropped where the PHP renders them.
+        tests: [not_null]
+      - name: start_month
+        description: Month of the start date (1-12). Stable slicer column.
+      - name: start_day
+        description: Day of month of the start date (1-31). Stable slicer column.
+      - name: anniversary_this_year
+        description: >
+          Anniversary inside the current calendar year; may already be in the
+          past. Null for a carer who started this year — their first anniversary
+          falls next year. Filter on this for a window that looks backwards.
+      - name: next_anniversary_date
+        description: >
+          Next anniversary on or after today — the report's date filter. Never the
+          start date itself: a carer who starts today gets their first
+          anniversary a year later, where the PHP lists a 0-year one on the day.
+          A 29 February start clamps to 28 February in a non-leap year (dateadd
+          clamps to month end) rather than yielding NULL as the source's
+          DATE_FORMAT does.
+        tests: [not_null]
+      - name: days_to_go
+        description: Days from today to next_anniversary_date; 0 = today. Never negative.
+      - name: years_active
+        description: >
+          Completed years of service as at the build date, not at the upcoming
+          anniversary — a carer 3 days from their 5th anniversary shows 4,
+          matching MySQL TIMESTAMPDIFF(YEAR, startDate, CURDATE()). Snowflake's
+          datediff(year, ...) on its own counts calendar-year boundaries and would
+          already show 5, so the SQL corrects for an anniversary still to come.
+      - name: years_at_next_anniversary
+        description: >
+          Which anniversary next_anniversary_date is (1 = first). The figure
+          years_active is usually misread as; the two are equal on the day
+          itself.
+      - name: gender
+        description: Gender (carer.sex), free text in the source.
+      - name: email
+        description: Email address; blank/whitespace normalised to null.
+      - name: area_id
+        description: >
+          The carer's area id (carer.area as a number; null where the source holds
+          free text). Branch-level RLS key.
+      - name: area_name
+        description: >
+          Area name (area.name via carer.area); null when carer.area matches no
+          area. Unlike the PHP it does not require an active
+          cmLevelAreaWorkgroup -> cmLevelWorkgroupBranch -> cmLevelBranch chain,
+          which there blanks the name of an area whose links have all been
+          deleted.
+      - name: workgroup
+        description: Comma-joined workgroup names for the area (int__area_hierarchy, active links only).
+      - name: branch
+        description: Comma-joined branch names for the area (int__area_hierarchy, active links only).
+      - name: state_id
+        description: Raw state code — 1 Active, 2 Pending, 3 Archived. Rows outside 1-3 are excluded.
+      - name: state
+        description: >
+          State label. Hardcoded 1/2/3 -> Active/Pending/Archived because the PHP
+          maps it in code rather than joining the state lookup.
+      - name: person_type_label
+        description: >
+          The report's Type column — always 'Carer', hardcoded by the PHP. Named
+          as on int__birthday_people, whose Type column is Client / Carer.
+      - name: company_id
+        description: Company key (carer.companyId). RLS key (with location_id).
+      - name: location_id
+        description: Location key (carer.location). RLS key (with company_id).
+
+  - name: int__plans_taken
+    description: >
+      Plans Taken report source — one row per plan started for a client or a carer
+      (cmFormsPlansTaken), with every column of the legacy All Plans Taken page
+      (cm/in/plansTakenReport.php). The page shows one type and one date window at
+      a time; this holds both types and the full history, and the page's inputs
+      become slicers: Type is person_type, the From / To window is a date range,
+      and Search (Started / Review / Completed Dates) picks which of started_date,
+      review_date or completed_date that range applies to.
+      THE ROW SET is the page's: deleted is null; the plan's own companyId and
+      locationId (the page lists one company's location); a client plan has a
+      clientId and no carerId, a carer plan the reverse; and a plan whose template
+      (cmPlans) is deleted is dropped, while one whose template is missing is kept,
+      as the page's left join with `pn.deleted IS NULL` in the WHERE does.
+      ONE RULE FOR EVERY VIEWER where the page has two. The page checks the person
+      only for an area-restricted admin (in the location, area in the admin's
+      scope, state 1-3, permissionId 4 for a carer) and nothing at all for an
+      unrestricted one, who also sees plans of deleted people (state 4) and of ids
+      with no person row, and plans of admin profiles. Here, for everyone, the
+      person has to exist and not be deleted (state 4), and a carer plan has to
+      belong to a care worker (permissionId 4): admin profiles live in the carer
+      table too, and their plans are left out (decided 2026-10-27), as the page
+      does for a restricted admin and as All Carers lists care workers only. On
+      R2 PROD (2026-10-25) that leaves out of care2's two lists (1,150,412 rows)
+      2,894 plans with no person row and 1,644 of deleted people; care3 loses 223
+      such plans of its 129,738, care5 9, beta none. Admin profiles held 1,748 live
+      plans in care3 (most with no state at all) and 28 in care2. The person's
+      location is not checked: the plan's own location is the row's, and the area
+      scope is applied at query time by the TenantArea role on area_id, as
+      everywhere else.
+      No plan has both a client and a carer, or neither (R2 PROD, 2026-10-25); if
+      one ever does, it is left out (the page shows a plan with neither in both
+      lists, with no name).
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, plan_taken_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: plan_taken_id
+        description: >
+          Plan taken primary key (cmFormsPlansTaken.id). Grain of the model WITH
+          source — the id is allocated per care and repeats across them.
+        tests: [not_null]
+      - name: plan_taken_key
+        description: source_key(source, plan_taken_id) (macros/source_key.sql), unique on its own.
+        tests: [not_null]
+      - name: person_type
+        description: >
+          'client' (clientId set, carerId null) or 'carer' (the reverse) — the page's
+          Type.
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['client', 'carer']
+      - name: person_type_label
+        description: Display form of person_type — Client / Carer.
+      - name: person_id
+        description: cmFormsPlansTaken.clientId or carerId, the person the plan is for. Not unique on its own.
+        tests: [not_null]
+      - name: person_key
+        description: >
+          The person in one integer, with mart__birthday_report's layout:
+          source_code * 10^13 + (1 client, 2 carer) * 10^12 + person_id. Count
+          distinct values for "people with a plan".
+        tests: [not_null]
+      - name: first_name
+        description: First name (client.fname / carer.fname).
+      - name: surname
+        description: Surname (client.sname / carer.sname). The page sorts the name column by it.
+      - name: full_name
+        description: >
+          The page's Client / Carer column, first name + ' ' + surname. A missing part
+          counts as blank, instead of blanking the whole name.
+      - name: person_state_id
+        description: >
+          The person's state (client.state / carer.state) — 1 Active, 2 Pending,
+          3 Archived. Never 4: deleted people are left out.
+      - name: person_state
+        description: >
+          State label — Active / Pending / Archived.
+          The page's State checkboxes and the colour of the name. The page paints
+          every carer name as Active (it reads an undefined variable); this
+          carries the carer's real state.
+      - name: area_id
+        description: >
+          The person's area (client.area for a client plan, carer.area for a carer
+          plan) as a number; null when the person has none. Branch-level RLS key for
+          the TenantArea role, which hides a row without an area from an
+          area-restricted admin, as the page does.
+      - name: area_name
+        description: >
+          The page's Area column (area.name), any area, deleted or not; null when no
+          area row holds that id.
+      - name: workgroup_names
+        description: >
+          The page's Work Group column: the area's live workgroups from
+          int__area_workgroup_branch, the mapping All Carers and All Clients use
+          (one standard, decided 2026-10-27), de-duplicated and joined with ', '
+          (the page joins with ','). The page checks only that the links are live,
+          so it also names a deleted workgroup that still has a live link; this
+          leaves it out. The page fills the column only for an area-restricted
+          admin; here it is filled for everyone. Null when the area is in no live
+          workgroup.
+      - name: branch_names
+        description: >
+          The page's Branch column, the live branches of those workgroups through
+          live cmLevelWorkgroupBranch links, as for workgroup_names; null when none
+          has one. Text for display: an area in several workgroups lists them all,
+          so a slicer on it lists combinations, not branches.
+      - name: plan_id
+        description: The plan template (cmFormsPlansTaken.planId). The page's Plan filter matches on it.
+      - name: plan_template_name
+        description: >
+          The template's name (cmPlans.name); null when the template row is missing.
+          The value for a Plan slicer: every version of a template shares it.
+      - name: plan_name
+        description: >
+          The page's Plan Name column: appendedPlanName when it is set, else the
+          template's name.
+      - name: started_at
+        description: The page's Started column (cmFormsPlansTaken.created), a timestamp.
+        tests: [not_null]
+      - name: started_date
+        description: started_at as a date — the page's Started Dates search, and the active date relationship.
+      - name: started_by_id
+        description: cmFormsPlansTaken.createdBy, the user who started the plan.
+      - name: started_by
+        description: >
+          The page's Started By column: the name of carer row createdBy in the plan's
+          company, office users included. Null when no such carer exists; the page
+          shows the previous row's name there.
+      - name: completed_at
+        description: The page's Completed column (cmFormsPlansTaken.completed); null while the plan is pending.
+      - name: completed_date
+        description: completed_at as a date — the page's Completed Dates search, and its Completed Date After / Before filter.
+      - name: is_completed
+        description: True once completed_at is set.
+      - name: completion_status
+        description: >
+          'Completed', or 'Pending' while completed_at is null — the text the page
+          shows in the Completed column for a plan not yet completed.
+      - name: completed_by_id
+        description: cmFormsPlansTaken.completedBy. A few pending plans carry one too.
+      - name: completed_by
+        description: The page's Completed By column, the name of carer row completedBy in the plan's company, as for started_by.
+      - name: review_date
+        description: >
+          The page's Review Date column (cmFormsPlansTaken.reviewDate), a date; the
+          page's Review Dates search and its Next Review Date After / Before filter.
+          Often null, and kept as typed: the source holds years from 2000 to 2925.
+      - name: next_plan_taken_id
+        description: >
+          cmFormsPlansTaken.nextPlan, the plan taken that followed this one when it
+          was reviewed. On R2 PROD (2026-10-25) it is the same template for the
+          same person, started later: always in care3, care5 and beta, and for 97% of
+          care2's links that find a row (7.5% of care2's links find none). Not on
+          the page. `archived`, the other column that sounds like versioning, is
+          never set.
+      - name: is_superseded
+        description: >
+          True when next_plan_taken_id points to a live plan taken, i.e. a newer
+          version of this plan exists. Not on the page; there for a "reviews due"
+          figure, where a past review_date means little on a superseded plan: on
+          R2 PROD care2, 430,845 live plans have a review date in the past, and
+          172,796 of them have no next plan at all.
+      - name: is_signed_off
+        description: >
+          The page's Sign Off column: a live cmFormsSignOff row with formTakenId =
+          the plan taken and the plan's company. A plan can carry several
+          signatures; this says only whether there is one.
+      - name: location_key
+        description: >
+          source_key(source, location_id), the key to mart__dim_location for the
+          location name.
+      - name: company_id
+        description: Company key (cmFormsPlansTaken.companyId). RLS key (with location_id).
+        tests: [not_null]
+      - name: location_id
+        description: Location key (cmFormsPlansTaken.locationId). RLS key (with company_id).
+        tests: [not_null]
+
+  # ---------------------------------------------------------------------------
+  # Workforce Capacity. A new report with no PHP original, so the rules below are
+  # this project's own and each one says where it came from. The two spell models
+  # are the backbone: every staff-hours pillar is clipped to the carer's spell,
+  # every demand pillar to the client's, and mart__workforce_movement counts them.
+  # ---------------------------------------------------------------------------
+  - name: int__carer_employment_spell
+    description: >
+      One row per care worker (permissionId = 4) with the period they were in the
+      active workforce, [start_date, leave_date). The staff side of the Workforce
+      Capacity headcount and the window every staff-hours pillar is clipped to.
+      LEAVE DATE = carer.deleted for a carer no longer Active. The app stamps it
+      when a carer leaves the Active state and clears it on reactivation (1 of
+      24,348 Active carers on DEV has it set). Profiling 2026-09-29: for Archived
+      carers it matches the completed state-3 cmFutureStatusChangeCarer row to the
+      day in 21,389 of 24,832 cases, and falls a median 14 days after the last
+      timesheet. A move to PENDING counts as leaving too. Pending carers with a
+      stamp look paused rather than onboarding: 1,755 of 4,197 have timesheets,
+      stamped a median 32 days after the last. Counting them as leavers keeps
+      headcount and movement reconciling. The cost: only the current state is
+      known, so a reactivated carer reads as continuously employed, and their pause
+      disappears from history. State 4 (Deleted) is a removed record, not a leaver:
+      2,034 of 2,324 never worked a shift. It is left out, as the Anniversary
+      report does. Also left out: a non-Active carer with no stamp (created straight
+      into Pending, never Active), a spell whose leave is on or before its start,
+      and a carer with no location, who is invisible to every reader anyway.
+      START DATE = carer.startDate. `start` is empty on all but ~160 rows. The day
+      the record was created is used when startDate is missing (1,312 Active
+      carers) or implausible (before 1990, or more than a year ahead: 2029, 3029).
+      Scheduled changes that have not run yet (future-dated cmFutureStatusChange*
+      rows) are NOT applied. DEV holds none to test against.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, carer_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: carer_id
+        description: Carer primary key (carer.id). Grain WITH source — the id repeats across cares.
+        tests: [not_null]
+      - name: state_id
+        description: carer.state now — 1 Active, 2 Pending, 3 Archived.
+      - name: start_date
+        description: First day in the workforce (startDate, else the created date).
+        tests: [not_null]
+      - name: leave_date
+        description: >
+          First day no longer in the workforce (carer.deleted as a date); null while
+          Active. Always after start_date.
+      - name: location_id
+        description: >
+          The carer's location (carer.location). Every staff row of the report is
+          filed here. Like dim_carer, it is the CURRENT location, so a move takes
+          the history with it.
+        tests: [not_null]
+      - name: area_id
+        description: >
+          The carer's area (carer.area as a number), the key the TenantArea role of
+          Workforce Capacity narrows a restricted admin to. The CURRENT area, as the
+          legacy area filter reads it, so a move takes the history with it, as for
+          location_id. Null where the source holds the area as free text.
+
+  - name: int__client_service_spell
+    description: >
+      One row per client with the period they were an active customer,
+      [start_date, leave_date). The customer side of the Workforce Capacity
+      headcount and the window the demand pillars are clipped to. The rules and
+      their reasons are those of int__carer_employment_spell. LEAVE DATE =
+      client.deleted for a client no longer Active: it matches the completed
+      state-3 cmFutureStatusChange row to the day in 44,940 of 45,623 Archived
+      clients, and falls a median 9 days after the last visit. Pending (on hold,
+      e.g. a hospital stay) counts as leaving. A client who comes back reads as
+      never having left, because the app clears the stamp. START DATE = the first
+      plausible (1990 to a year ahead) of inductionDate (dim_client's
+      service_commencement; the first visit falls on it at the median),
+      admissionDate, and the created date. Only 28,885 of 54,884 Active clients
+      have a usable inductionDate, and values like 2107 and 0206 occur. State 4
+      (Deleted) is left out.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, client_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: client_id
+        description: Client primary key (client.id). Grain WITH source — the id repeats across cares.
+        tests: [not_null]
+      - name: state_id
+        description: client.state now — 1 Active, 2 Pending, 3 Archived.
+      - name: start_date
+        description: First day as a customer (inductionDate, else admissionDate, else the created date).
+        tests: [not_null]
+      - name: leave_date
+        description: >
+          First day no longer a customer (client.deleted as a date); null while
+          Active. Always after start_date.
+      - name: location_id
+        description: The client's current location (client.location). Every demand row of the report is filed here.
+        tests: [not_null]
+      - name: area_id
+        description: >
+          The client's current area (client.area as a number), the TenantArea key of
+          every demand row, as int__carer_employment_spell's area_id is for staff
+          rows. Null where the source holds the area as free text.
+
+  - name: int__workforce_contracted_hours
+    description: >
+      "Staff contracted" pillar of Workforce Capacity: cmContractsHours weekday
+      minutes attributed per carer per day, from the whole contract history up to
+      the projection horizon (macros/projection_horizon.sql). It deliberately
+      differs from int__carer_contracted_hours, the Carer Hours port, which reads
+      the current contract only and would project today's hours back over every
+      earlier contract. ARCHIVED ROWS ARE THE HISTORY: an edit closes the old row
+      (archiveId 2) on the day its successor starts (5,226 of 5,791 archived rows).
+      So each day takes ONE contract, the one with the latest start (archiveId 1
+      before 2 on a tie). CLIPPED TO THE EMPLOYMENT SPELL: 4,870 current,
+      open-ended contracts belong to Archived carers and would otherwise count
+      their hours for ever, the three-month outlook included. Not clipped at
+      start_date, which is looser data than the contract's own start. Filed at the
+      carer's location; the contract's own locationId differs on 21 rows.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, carer_id, calendar_date]
+    columns:
+      - name: carer_id
+        description: Carer key (cmContractsHours.carerId).
+      - name: location_id
+        description: The carer's location (int__carer_employment_spell).
+      - name: area_id
+        description: The carer's area (int__carer_employment_spell).
+      - name: calendar_date
+        description: A day inside the contract and the employment spell.
+      - name: contracted_hrs
+        description: That weekday's contracted minutes / 60 (0 on a day the contract has no hours).
+
+  - name: int__workforce_available_hours
+    description: >
+      "Staff available" pillar of Workforce Capacity: cmCarerAvailability windows
+      expanded per carer per day, up to the projection horizon. The windows have
+      the cm_assigned_hours shape: `day` is ISO weekdays, repeating every `week`
+      weeks from the Monday of startDate's week, `length` minutes from startTime.
+      week = 0 is a single date (all 46,043 such rows have startDate = endDate).
+      A DAY IS THE UNION OF ITS WINDOWS, NOT THE SUM: 36,905 pairs of live windows
+      overlap, across 7,337 carers, typically an updated pattern added beside the
+      old one without closing it. Summing would count those hours twice. A window
+      past midnight counts in full on its start date. CAPPED AT 24 HOURS A DAY: the
+      source does not check a window's length. On R2 PROD (2026-10-07) care2
+      carer 32702 (location 219) held one window of about 26.1 million minutes,
+      which read as 435,415 h on every day and put the account at 91.6M available
+      hrs/week; 5,607 carer-days over 24 h held 2.38bn of its 2.40bn hours.
+      Clipped to the employment spell. Median availability is 40 h/week against
+      21 h contracted for the same carers, so "available" is the wider offer,
+      including flexible hours.
+      Per the story, it feeds ONLY the Available Hours card and chart line. A
+      carer or company with no rows simply has none, and the report reads that
+      as 0.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, carer_id, calendar_date]
+    columns:
+      - name: carer_id
+        description: Carer key (cmCarerAvailability.carerId).
+      - name: location_id
+        description: The carer's location (int__carer_employment_spell).
+      - name: area_id
+        description: The carer's area (int__carer_employment_spell).
+      - name: calendar_date
+        description: A day with at least one availability window.
+      - name: available_hrs
+        description: Minutes covered by the union of the day's windows / 60, capped at 24 h.
+
+  - name: int__workforce_scheduled_hours
+    description: >
+      "Scheduled" pillar of Workforce Capacity: roster occurrences
+      (int__recurr_occurrences) per day up to the projection horizon, which makes
+      the three-month outlook a direct projection of the recurring roster rules
+      as they stand, not a forecast. Same filters as the Carer Hours scheduled
+      pillar (statusId = 1, no-shows out, confirmSch upstream, event minutes), so
+      scheduled_hrs reconciles with Carer Hours' Scheduled for an active carer. A
+      rule with no end date carries the app's 2030-02-02 sentinel (514k live
+      rules), so it simply runs to the horizon. A rule ending inside the window
+      stops on its dateFinish. Only visits to a customer inside their service
+      spell count. Each visit lands in exactly one column. inactive_carer_hrs
+      exists because live rules routinely outlive the carer they name: 15,289
+      live rules on DEV are booked to Archived carers, a median 855 days after
+      they left. The visit is still on the client's schedule and needs a carer,
+      so it is demand, but it is not an active carer's workload. It gets a column
+      of its own rather than being folded into unassigned, because it is a
+      reassignment list the office can act on.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, location_id, area_id, carer_id, calendar_date]
+    columns:
+      - name: location_id
+        description: The carer's location for scheduled_hrs, the client's for the other two.
+        tests: [not_null]
+      - name: area_id
+        description: >
+          The carer's area for scheduled_hrs, the client's for the other two (the
+          spell models). The rows booked to no active care worker split by it.
+      - name: carer_id
+        description: The care worker the hours are booked to; NULL on the rows booked to no active care worker.
+      - name: calendar_date
+        description: Occurrence date.
+      - name: scheduled_hrs
+        description: Hours booked to a care worker inside their employment spell.
+      - name: unassigned_hrs
+        description: Hours booked to no one (carerId = 0).
+      - name: inactive_carer_hrs
+        description: >
+          Hours booked to a carer who is not an active care worker on the date —
+          left, pending, deleted, or not a care worker (permissionId <> 4).
+
+  - name: int__carer_tags
+    description: >
+      The live tags of each carer, one row per carer and tag: tagPick rows with a
+      carerId and no `deleted`, joined to tags with no `deleted`, as the All Carers
+      page reads them. A tag picked twice for one carer is one row. The single
+      definition behind both the comma-joined Tags column of int__all_carers and
+      mart__bridge_carer_tag. Not restricted to the All Carers row set; the bridge
+      does that.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, carer_id, tag_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: carer_id
+        description: Carer key (tagPick.carerId). Grain with source + tag_id.
+        tests: [not_null]
+      - name: tag_id
+        description: Tag key (tag.id). Grain with source + carer_id.
+        tests: [not_null]
+      - name: tag_name
+        description: Tag label (tag.tag).
+      - name: tag_color
+        description: Tag colour (tag.color), the label colour on the legacy page.
+      - name: tag_category_id
+        description: Tag category (tag.tagCategoryId); the legacy page lists a carer's tags in this order.
+      - name: is_carer_tag
+        description: >
+          True for a carer-side tag (tag.carerSide = 1), the only ones the legacy
+          Tags filter offers. The Tags column shows every live tag of the carer, and
+          the filter matches a carer holding any selected tag, so a carer can carry
+          a tag the filter never lists.
+
+  - name: int__area_workgroup_branch
+    description: >
+      Every live area -> workgroup link, with the workgroup's live branches and the
+      names. The area-workgroup link and the workgroup have to be undeleted; a
+      branch counts when its link (cmLevelWorkgroupBranch) and the branch are too.
+      A workgroup with no live branch keeps one row with branch_id and branch_name
+      null. The area row itself is not checked. One definition for two lists, and
+      both take every link: All Clients as its legacy page does (getAreaWorkBranch()
+      names a workgroup with no branch, and the Workgroup filter offers every live
+      workgroup; int__all_clients, mart__bridge_client_workgroup), All Carers by
+      the same rule (mart__bridge_carer_workgroup, decided 2026-10-27), although
+      that page's Workgroup filter offers only the workgroups of the picked
+      branches. Neither list uses it to decide who is listed; the Work Group and
+      Branch columns of Plans Taken (int__plans_taken) and Plan & Assessment Dates
+      (int__assessments, int__skin_assessments) read it too. One quirk is not
+      copied: a workgroup whose only branch link is deleted has a blank branch
+      here, while the page drops that workgroup from its column (a WHERE on a
+      LEFT JOIN).
+      mart__area_scope is NOT built on it: the TenantArea role follows the
+      legacy access list, which checks only the links, so it also reaches an area
+      through a deleted workgroup or branch.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, area_id, workgroup_id, branch_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: area_id
+        description: Area id (cmLevelAreaWorkgroup.areaId).
+        tests: [not_null]
+      - name: workgroup_id
+        description: Workgroup id (cmLevelAreaWorkgroup.workgroupId). An area can sit in several workgroups.
+        tests: [not_null]
+      - name: workgroup_name
+        description: Workgroup name (cmLevelWorkgroup.name).
+      - name: branch_id
+        description: >
+          Branch id (cmLevelWorkgroupBranch.branchId); null for a workgroup with no
+          live branch. Nearly always one per workgroup, but the link table allows
+          more (one R2 care2 workgroup has two live branches, 2026-10-25).
+      - name: branch_name
+        description: Branch name (cmLevelBranch.name); null with branch_id.
+
+  - name: int__all_carers
+    description: >
+      All Carers report source — one row per carer the legacy All Carers page lists
+      (cm/in/carer/carersTotalAll.php, rows from ajax/tables/carerTblTotalAll.php),
+      with every column the page can show. The row set is the page's: state < 4
+      (Active, Pending, Archived; 4 is deleted), permissionId = 4 (office users live
+      in the same table), wardFlag null, and a location (the page lists one
+      location's carers, so a carer with none is on no page; none such on R2 PROD,
+      2026-10-25). carer.deleted is NOT filtered: Pending and Archived carers carry
+      a deleted stamp and the page lists them. The page has no dates and no period,
+      so the model holds the current state only.
+      The area, workgroup and branch mapping does not decide who is listed, as on
+      the page: a carer with no area, or with an area in no live workgroup, is
+      listed. The page's area scope is not applied in the build: it is the
+      logged-in admin's area restriction, a session property with no equivalent in
+      a batch build, so the list is company/location-wide. Each row carries
+      area_id instead, and the TenantArea role of the embedded model applies the
+      restriction at query time (mart__area_scope).
+      ONE DELIBERATE DEPARTURE (decided 2026-10-27, option B): under an area limit
+      the role hides a carer with a blank area_id, as on the All Clients page. The
+      All Carers page shows carers with no area to every admin, area-restricted or
+      not (`OR area IS NULL`). The app no longer lets anyone save a carer without
+      an area, so such carers are old records (on R2 PROD, 2026-10-25, 2,861 of
+      care2's 49,730 active carers had no area, and 10,776 more an area in no live
+      workgroup).
+      The page's Branch and Workgroup filters never narrowed the rows (an `=`
+      where `==` was meant in branchesWorkgroupsAreaFilters.php); in Power BI they
+      do, through mart__bridge_carer_workgroup.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, carer_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: carer_id
+        description: >
+          Carer primary key (carer.id). Grain of the model WITH source — the id is
+          allocated per care and repeats across them.
+        tests: [not_null]
+      - name: carer_key
+        description: >
+          source_key(source, carer_id) (macros/source_key.sql). Same value as
+          mart__dim_carer's key for the same carer.
+        tests: [not_null]
+      - name: carer_no
+        description: >
+          The page's No. column: carer.carerNum on the R3 servers (sources alpha
+          and alpha2), carer.carerId everywhere else, as the page switches on the
+          server's country. Text in both cases. A new R3 source has to be
+          added to the list in the SQL.
+      - name: has_private_note
+        description: carer.privateNote = 1 — the red warning icon in front of No.
+      - name: has_future_status_change
+        description: >
+          The carer has a status change still to run in their own location
+          (cmFutureStatusChangeCarer with completed and deleted null) — the "future
+          status set" icon in front of No.
+      - name: first_name
+        description: First name (carer.fname).
+      - name: surname
+        description: Surname (carer.sname). The page sorts the Name column by it.
+      - name: full_name
+        description: >
+          The page's Name column, first name + ' ' + surname. A missing part counts
+          as blank, as in the PHP, instead of blanking the whole name.
+      - name: gender
+        description: The page's Gender column, raw carer.sex (F / M drive its icon).
+      - name: address
+        description: >
+          The page's Address column: address1, town, county and post code, each
+          trimmed, blanks skipped, joined with ', '. Null when all four are blank.
+      - name: address_line_1
+        description: carer.address1. The Address search matches it or town, not county or post code.
+      - name: town
+        description: carer.town.
+      - name: county
+        description: The page's County column (carer.county).
+      - name: post_code
+        description: The page's Post Code column (carer.postCode).
+      - name: area_id
+        description: >
+          carer.area as a number; null when the carer has no area (or one held as
+          free text). Branch-level RLS key for the TenantArea role, which hides a
+          null under an area limit (see the model description).
+      - name: area_name
+        description: >
+          The page's Area column (area.name). Any area of the location, deleted or
+          not, as the page looks it up; null when no area row holds that id.
+      - name: phone
+        description: The page's Phone column (carer.phone).
+      - name: phone2
+        description: carer.phone2. Not shown on the page, but its Phone search matches it as well.
+      - name: email
+        description: The page's E-Mail column (carer.email).
+      - name: tags
+        description: >
+          The page's Tags column: the carer's live tags (int__carer_tags) joined
+          with ', ', in tag category order, then by name. Filter by tag through
+          mart__bridge_carer_tag, not on this text.
+      - name: status_id
+        description: carer.statusId as a number (the column is text in some sources).
+      - name: status
+        description: >
+          The page's Status column (status.type for carer.statusId). Looked up by id
+          alone: the page's location-or-global restriction only decides which
+          statuses its filter offers.
+      - name: status_colour
+        description: >
+          The colour the page paints the Status column with (status.colour): a
+          Bootstrap 3 context class (info, danger, primary, success, warning), not a
+          colour code. The Power BI docs map it to the colours.
+      - name: status_change_date
+        description: >
+          The page's Status Change column: dateChange of the carer's latest
+          statusPick row (highest id, no deleted or location check), as a date.
+      - name: status_comment
+        description: The page's Comment column, the note of that same statusPick row.
+      - name: transport_type_id
+        description: Raw carer.transportType code behind transport_type.
+      - name: transport_type
+        description: >
+          The page's Transport Type column: 1 and 6 Driving, 2 and 39 Walking, 3
+          Cycle, 4 and 33 Bus / public, 36 Motorcycle; any other code is null.
+      - name: known_as
+        description: The page's Known As column (carer.knownAs); the page heads it "Agent Ref" for company 164.
+      - name: pay_cycle
+        description: >
+          The page's Pay Cycle column, from cmCarerBank for the carer and their
+          location: 'weekly' Weekly payroll, 'monthly' Monthly payroll, anything
+          else null. The page reads whichever row MySQL returns, with no deleted
+          check; this takes the newest row (highest id), which is the same row
+          whenever the carer has one. Null for every carer of a source without
+          cmCarerBank yet (is_pay_cycle_loaded).
+      - name: is_pay_cycle_loaded
+        description: >
+          False for a source whose cmCarerBank has not been ingested yet (only R2
+          care2 and care3 had it on 2026-10-08), so its null pay_cycle means "not
+          loaded", not "no pay cycle". Hide the Pay Cycle column and slicer where it
+          is false. Drop the column once every source has the table.
+      - name: nationality
+        description: >
+          The page's Nationality column, first letter of each word upper-cased.
+          Snowflake's initcap also lower-cases the rest of each word, where PHP's
+          ucwords leaves it as typed, so 'BRITISH' reads 'British' here.
+      - name: state_id
+        description: Raw carer.state — 1 Active, 2 Pending, 3 Archived.
+      - name: state
+        description: State label — Active / Pending / Archived. The page's tab, here a slicer.
+      - name: location_key
+        description: >
+          source_key(source, location_id), the key to mart__dim_location: the
+          location name for Power BI and for all_carers_sv.
+      - name: company_id
+        description: Company key (carer.companyId). RLS key (with location_id).
+      - name: location_id
+        description: Location key (carer.location). RLS key (with company_id).
+
+  - name: int__client_tags
+    description: >
+      The live tags of each client, one row per client and tag: tagPick rows with a
+      clientId and no `deleted`, joined to tags with no `deleted`. A tag picked twice
+      for one client is one row. The single definition behind both the comma-joined
+      Tags column of int__all_clients and mart__bridge_client_tag. Not restricted to
+      the All Clients row set; the bridge does that.
+      ONE DEPARTURE from the All Clients page: its Tags column does not check
+      tag.deleted, so a deleted tag still shows there, while its Tags filter offers
+      live tags only. Here a deleted tag is gone from both, as on the All Carers
+      page, so the column never shows a tag the slicer cannot find.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, client_id, tag_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: client_id
+        description: Client key (tagPick.clientId). Grain with source + tag_id.
+        tests: [not_null]
+      - name: tag_id
+        description: Tag key (tag.id). Grain with source + client_id.
+        tests: [not_null]
+      - name: tag_name
+        description: Tag label (tag.tag).
+      - name: tag_color
+        description: Tag colour (tag.color), the label colour on the legacy page.
+      - name: tag_category_id
+        description: Tag category (tag.tagCategoryId); the legacy page lists a client's tags in this order.
+      - name: is_client_tag
+        description: >
+          True for a client-side tag (tag.clientSide = 1), the only ones the legacy
+          Tags filter offers. The Tags column shows every live tag of the client, and
+          the filter matches a client holding any selected tag, so a client can carry
+          a tag the filter never lists.
+
+  - name: int__client_job_types
+    description: >
+      The job types of each client, one row per client and job type:
+      client.jobTypes, a comma-separated list of jobtype ids, split into rows and
+      joined to the job types, deleted or not. A non-numeric token, and an id with
+      no jobtype row, are dropped; an id listed twice is one row, at its first
+      place. Feeds the comma-joined Job Type column of int__all_clients, which
+      names every job type in list order as the All Clients page does, deleted
+      ones included (on R2 PROD, 2026-10-25, 9,176 care2 clients had only deleted
+      or unknown ones, and 24% of care3 clients with job types had a deleted one),
+      and mart__bridge_client_job_type, which keeps the live ones (is_live_job_type),
+      the only ones the page's search offers. Not restricted to the All Clients row
+      set; the bridge does that.
+      ONE DEPARTURE from the page: its search matches the ids as a substring of the
+      list (job type 1 also finds 10, 11, 21), which a row per id cannot do.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, client_id, job_type_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: client_id
+        description: Client key (client.id). Grain with source + job_type_id.
+        tests: [not_null]
+      - name: job_type_id
+        description: Job type key (jobtype.id), one entry of client.jobTypes. Grain with source + client_id.
+        tests: [not_null]
+      - name: job_type_name
+        description: Job type name (jobtype.name).
+      - name: list_position
+        description: >
+          Where the id first appears in client.jobTypes (split_to_table's index), so
+          the Job Type column keeps the page's order.
+      - name: is_live_job_type
+        description: >
+          True when the job type is not deleted (jobtype.deleted null). The bridge
+          keeps only these; the Job Type column shows both.
+
+  - name: int__all_clients
+    description: >
+      All Clients report source — one row per client the legacy All Clients page
+      lists (cm/in/clientsTotalAll.php, rows from
+      ajax/tables/clientsTotalAllTableBc.php), with every column the page can show.
+      The row set is the page's: state < 4 (Active, Pending, Archived; 4 is deleted),
+      wardFlag null, and a location (the page lists one location's clients, so a
+      client with none is on no page; none such on R2 PROD, 2026-10-25).
+      client.deleted is NOT filtered: Pending and Archived clients carry a deleted
+      stamp and the page lists them. The page has no dates and no period, so the
+      model holds the current state only.
+      The area, workgroup and branch mapping does NOT decide who is listed, as on
+      the page: a client with no area, or with an area in no live workgroup, is
+      listed, with blank Branch and Workgroup columns. (Leaving them out, as All
+      Carers did until 2026-10-27, would have hidden 23,723 of care2's 78,399
+      active clients on R2 PROD, 2026-10-25.)
+      The page's area scope is not applied in the build: it is the logged-in
+      admin's area restriction, a session property with no equivalent in a batch
+      build, so the list is company/location-wide. Each row carries area_id
+      instead, and the TenantArea role of the embedded model applies the
+      restriction at query time (mart__area_scope). Under an area limit the role
+      hides a row with a blank area_id, as the page drops clients with no area
+      once its scope has a value. The page's Branch / Workgroup / Area filters
+      REPLACE the admin's own scope, so an admin restricted to one workgroup can
+      pick another and see its clients; in Power BI the slicers
+      (mart__bridge_client_workgroup) only narrow inside RLS.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, client_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: client_id
+        description: >
+          Client primary key (client.id). Grain of the model WITH source — the id is
+          allocated per care and repeats across them.
+        tests: [not_null]
+      - name: client_key
+        description: >
+          source_key(source, client_id) (macros/source_key.sql). Same value as
+          mart__dim_client's key for the same client.
+        tests: [not_null]
+      - name: client_no
+        description: The page's No. column (client.residentId), text.
+      - name: has_private_note
+        description: client.privateNote = 1 — the red warning icon in front of No.
+      - name: has_future_status_change
+        description: >
+          The client has a status change still to run in their own location
+          (cmFutureStatusChange with completed and deleted null) — the "future
+          status set" icon in front of No.
+      - name: first_name
+        description: First name (client.fname).
+      - name: surname
+        description: Surname (client.sname). The page sorts the Name column by it.
+      - name: full_name
+        description: >
+          The page's Name column, first name + ' ' + surname. A missing part counts
+          as blank, as in the PHP, instead of blanking the whole name. The page's
+          Name search also matches first name and surname with no space between.
+      - name: gender
+        description: >
+          The page's Gender column from client.sex: F, 2 or Female → Female, M, 1 or
+          Male → Male, anything else null (O, NB, 'Select' and other codes typed in
+          a few hundred R2 records). The page reads the one-letter and the numeric
+          codes; the spelled-out words are an addition.
+      - name: address
+        description: >
+          The page's Address column: currentAddress1, currentTown, currentCounty and
+          post code, each trimmed, blanks skipped, joined with ', '. Null when all
+          four are blank.
+      - name: address_line_1
+        description: client.currentAddress1. The Address search matches it or town, not county or post code.
+      - name: town
+        description: client.currentTown.
+      - name: county
+        description: The page's County column (client.currentCounty).
+      - name: post_code
+        description: The page's Post Code column (client.postCode).
+      - name: is_location_confirmed
+        description: >
+          False when client.latitude is blank — the red "Location not confirmed"
+          map marker next to the post code.
+      - name: branch_names
+        description: >
+          The page's Branch column: the live branches of the live workgroups of the
+          client's area, distinct, in name order, joined with ', '. An area can
+          reach several. Null when none. Filter by branch through
+          mart__bridge_client_workgroup, not on this text.
+      - name: workgroup_names
+        description: >
+          The page's Workgroup column: every live workgroup of the area, with or
+          without a branch, the same way. Null when the area is in none, or the
+          client has no area.
+      - name: area_id
+        description: >
+          client.area as a number; null when the client has no area (or one held
+          as free text). Branch-level RLS key for the TenantArea role, which hides
+          a null under an area limit.
+      - name: area_name
+        description: >
+          The page's Area column (area.name). Any area of the location, deleted or
+          not, as the page looks it up; null when no area row holds that id.
+      - name: email
+        description: The page's E-mail column (client.email).
+      - name: phone
+        description: >
+          The page's Phone column: phoneHome and phoneMobile, blanks skipped, joined
+          with ', '. Null when both are blank.
+      - name: phone_home
+        description: client.phoneHome. The Phone search matches it or phone_mobile.
+      - name: phone_mobile
+        description: client.phoneMobile.
+      - name: date_of_birth
+        description: The page's DOB column (client.dob).
+      - name: job_types
+        description: >
+          The page's Job Type column: every job type of the client
+          (int__client_job_types), deleted ones included, joined with ', ' in the
+          order of client.jobTypes. Filter by job type through
+          mart__bridge_client_job_type, which offers only the live ones, not on
+          this text.
+      - name: tags
+        description: >
+          The page's Tags column: the client's live tags (int__client_tags) joined
+          with ', ', in tag category order, then by name. Filter by tag through
+          mart__bridge_client_tag, not on this text.
+      - name: status_id
+        description: client.statusId as a number (the column is text in the source).
+      - name: status
+        description: >
+          The page's Status column (status.type for client.statusId). Looked up by
+          id alone, as the page does for an id outside the location's and the
+          global statuses; that restriction only decides what its filter offers.
+      - name: status_colour
+        description: >
+          The colour the page paints the Status column with (status.colour): a
+          Bootstrap 3 context class (info, danger, primary, success, warning), not a
+          colour code. The Power BI docs map it to the colours.
+      - name: status_change_at
+        description: >
+          The page's Status Change column: `created` of the client's latest
+          statusPick row (highest id, no deleted or location check), with date and
+          time as the page shows them. statusPick.created lands as TIMESTAMP_TZ; it
+          is cast to TIMESTAMP_NTZ (the wall-clock value as loaded), because Power BI
+          converts a time-zoned value to the local time of whichever machine
+          refreshes, so Desktop and the service would disagree.
+      - name: status_comment
+        description: The page's Comment column, the note of that same statusPick row.
+      - name: first_contact_date
+        description: >
+          client.admissionDate. The page heads the column with the company's own
+          label for first contact.
+      - name: service_commenced_date
+        description: >
+          client.inductionDate. The page heads the column with the company's own
+          label for service commenced.
+      - name: council_id
+        description: The page's Council Id column (client.councilId).
+      - name: state_id
+        description: Raw client.state — 1 Active, 2 Pending, 3 Archived.
+      - name: state
+        description: State label — Active / Pending / Archived. The page's tab, here a slicer.
+      - name: location_key
+        description: >
+          source_key(source, location_id), the key to mart__dim_location: the
+          location name for Power BI and for all_clients_sv.
+      - name: company_id
+        description: Company key (client.companyId). RLS key (with location_id).
+      - name: location_id
+        description: Location key (client.location). RLS key (with company_id).
+
+  # ---------------------------------------------------------------------------
+  # Plan & Assessment Dates (cm/in/plansAssesmentRpt.php). Three tabs, each a list
+  # of what is due for review in a date window: Plans is int__plans_taken as it
+  # stands (its review_date is the window), Assessments and Wound / Skin are the
+  # two models below.
+  # ---------------------------------------------------------------------------
+  - name: int__assessments
+    description: >
+      Assessments tab of the legacy Plan & Assessment Dates page — one row per
+      live assessment of a client (assessment), with every column of the tab. The
+      page shows the assessments whose next date (nextAss) falls in its From / To
+      window, for one client state at a time; this holds them all, and the window
+      and the state become slicers.
+      THE ROW SET is the page's: deleted is null; the assessment's own companyId
+      and locationId; its type has to exist (deleted or not: the page does not
+      check assessmentType.deleted), and so does its client, unless deleted
+      (state 4). On R2 PROD (2026-10-28) that leaves out of care2's live rows 6
+      with no type row, 46 with no client row and 792 of deleted clients, and in
+      beta 22,926 of 24,172: assessments from 2014-2019 whose 6,598 client ids have
+      no client row. The page also needs the client's current location to be the
+      assessment's; this does not check it, as Plans Taken does not (38 care2
+      rows and 2 in care5 differ). With these rules, the page's default view
+      (Active, next date in the last 14 days) counts what the legacy SQL counts in
+      every R2 care (care2 1,116, care3 74, care5 23).
+      NOT DE-DUPLICATED, as on the page: an assessment whose next date is in the
+      window is listed even when a newer one of the same type has replaced it.
+      is_latest_of_type marks the one that still counts.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, assessment_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: assessment_id
+        description: >
+          Assessment primary key (assessment.id). Grain of the model WITH source —
+          the id is allocated per care and repeats across them.
+        tests: [not_null]
+      - name: assessment_key
+        description: source_key(source, assessment_id) (macros/source_key.sql), unique on its own.
+        tests: [not_null]
+      - name: assessment_type_id
+        description: The type (assessment.assessmentId -> assessmentType.id). The page's Assessment filter matches on it.
+        tests: [not_null]
+      - name: assessment_type_name
+        description: The page's Assessment Name column, the type's current name (assessmentType.name).
+      - name: is_assessment_type_deleted
+        description: >
+          The type is deleted (assessmentType.deleted is set). The page lists its
+          assessments anyway but leaves the type out of its Assessment filter:
+          16,111 care2 rows on R2 PROD.
+      - name: assessment_name
+        description: >
+          The name the assessment was saved with (assessment.name). Not on the page.
+          It differs from the type's current name on 29% of care2's rows, mostly
+          because types were renamed later ("Service Call - Candidate Call" under
+          the type "Service Call - Candidate").
+      - name: client_id
+        description: assessment.clientId, the client assessed. Not unique on its own.
+        tests: [not_null]
+      - name: client_key
+        description: source_key(source, client_id), the same value as mart__dim_client's key for the same client.
+        tests: [not_null]
+      - name: first_name
+        description: First name (client.fname).
+      - name: surname
+        description: Surname (client.sname).
+      - name: full_name
+        description: >
+          The page's Client column, first name + ' ' + surname. A missing part
+          counts as blank, instead of blanking the whole name.
+      - name: client_state_id
+        description: The client's state (client.state) — 1 Active, 2 Pending, 3 Archived. Never 4.
+      - name: client_state
+        description: >
+          State label — Active / Pending / Archived. The page's Status (Active or
+          Pending: Archived is commented out of its dropdown) and the colour of the
+          name. 53% of care2's rows are of Archived clients.
+      - name: area_id
+        description: >
+          The client's area (client.area) as a number; null when the client has
+          none. Branch-level RLS key for the TenantArea role, which hides a row
+          without an area from an area-restricted admin, as the page does.
+      - name: area_name
+        description: The page's Area column (area.name), any area, deleted or not; null when no area row holds that id.
+      - name: workgroup_names
+        description: >
+          The page's Work Group column: the area's live workgroups from
+          int__area_workgroup_branch, joined with ', ', as on Plans Taken. Null
+          when the area is in no live workgroup.
+      - name: branch_names
+        description: The page's Branch column, the live branches of those workgroups; null when none has one.
+      - name: assessment_date
+        description: >
+          The page's Assessment Date column (assessment.assessment), the date the
+          assessment was done. Null on 19% of care2's live rows, nearly all of them
+          with no next date either.
+      - name: next_assessment_date
+        description: >
+          The page's Next Assessment Date column (assessment.nextAss), when the
+          next one is due — the date the page's window applies to. Null on 57% of
+          care2's rows; typed years run from 1933 to 2064.
+      - name: note
+        description: The page's Note column (assessment.note).
+      - name: is_latest_of_type
+        description: >
+          True on the client's newest assessment of this type: the latest
+          assessment_date, the higher id on a tie, an assessment without a date
+          counting as the oldest. Not on the page; there for a "still due" figure,
+          where an older assessment's next date no longer counts. On R2 PROD 5,428
+          care2 client-type pairs hold more than one assessment, one of them 2,611.
+      - name: location_key
+        description: source_key(source, location_id), the key to mart__dim_location.
+      - name: company_id
+        description: Company key (assessment.companyId). RLS key (with location_id).
+        tests: [not_null]
+      - name: location_id
+        description: Location key (assessment.locationId). RLS key (with company_id).
+        tests: [not_null]
+
+  - name: int__skin_assessments
+    description: >
+      Wound / Skin tab of the legacy Plan & Assessment Dates page — one row per
+      live entry of a client's skin or wound record (cmSkinAssessments). An entry
+      is a wound's first assessment or one of its reviews, and a review points at
+      the first entry with parentId, so wound_id is parentId, or the entry's own
+      id on a first entry. On R2 PROD (2026-10-28) reviews never nest and always
+      stay on the wound's client and location.
+      THE PAGE (SkinAssessmentFunctions::getLastAssessments()) takes the wounds
+      with a live entry whose review date falls in its window, shows each by its
+      latest live entry (highest id), drops it when that entry is healed, and
+      keeps it only when the client's state is the one picked. A wound can
+      therefore be listed with a review date outside the window (36 of care2's
+      361 in the default view). Whether that latest-entry lookup also sees deleted
+      entries is not documented; on R2 PROD (2026-10-29) one care2 wound has a
+      deleted latest entry, and its live entry is due on 1970-01-01, so no window
+      differs. Here the window applies to review_date, the
+      table shows the wound_* columns and is_wound_healed = false stands in for
+      the healed rule; with these, the page's default view (Active, last 14 days)
+      counts what the legacy SQL counts in every R2 care (care2 361, care3 141,
+      care5 109).
+      THE ROW SET: deleted is null and a companyId; the client has to exist and
+      not be deleted (state 4: 121 care2 entries); an entry without a location
+      takes its client's, where the page shows it in every location of the
+      company (no such entry on R2 PROD). The page scopes this tab by area only
+      when a session value left by another page happens to be set; here the
+      TenantArea role applies the client's area, as on the other two tabs.
+      READS raw_access THROUGH union_cares_present(): cmSkinAssessments reached R2
+      care2, care5 and beta on 2026-10-15 and care3 on 2026-10-19; R1, R3 and DEV
+      were not checked. A source without the table has no rows here. The gap
+      shows on the deploy job instead, which is red on that source's raw_access
+      view (the non-gating leaf step) until ingestion catches up: a list has no
+      row to flag it on. Move to a staging model once every care has the table.
+    tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns: [source, skin_assessment_id]
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+        tests: [not_null]
+      - name: skin_assessment_id
+        description: >
+          Entry primary key (cmSkinAssessments.id). Grain of the model WITH source —
+          the id is allocated per care and repeats across them.
+        tests: [not_null]
+      - name: skin_assessment_key
+        description: source_key(source, skin_assessment_id), unique on its own.
+        tests: [not_null]
+      - name: wound_id
+        description: >
+          The wound the entry belongs to, by its first entry's id: parentId, or the
+          entry's own id when parentId is empty or 0. 4 care2 reviews point at a
+          first entry that is no longer in the table; they still form one wound.
+        tests: [not_null]
+      - name: wound_key
+        description: source_key(source, wound_id). Distinct count = wounds.
+        tests: [not_null]
+      - name: is_latest_entry
+        description: The wound's latest live entry (highest id), the one the page shows. One per wound.
+      - name: client_id
+        description: cmSkinAssessments.clientId, the client the wound is on. Not unique on its own.
+        tests: [not_null]
+      - name: client_key
+        description: source_key(source, client_id), the same value as mart__dim_client's key for the same client.
+        tests: [not_null]
+      - name: first_name
+        description: First name (client.fname).
+      - name: surname
+        description: Surname (client.sname).
+      - name: full_name
+        description: The page's Client column, first name + ' ' + surname, as on int__assessments.
+      - name: client_state_id
+        description: The client's state (client.state) — 1 Active, 2 Pending, 3 Archived. Never 4.
+      - name: client_state
+        description: >
+          State label — Active / Pending / Archived; the page's Status. The page
+          paints every name in the colour of the picked status; this carries the
+          client's own.
+      - name: area_id
+        description: >
+          The client's area (client.area) as a number; null when the client has
+          none. Branch-level RLS key for the TenantArea role.
+      - name: area_name
+        description: The client's area name (area.name). Not on the page, which has no area columns on this tab.
+      - name: workgroup_names
+        description: The area's live workgroups, as on int__assessments. Not on the page.
+      - name: branch_names
+        description: The live branches of those workgroups, as on int__assessments. Not on the page.
+      - name: assessment_name
+        description: The entry's name (cmSkinAssessments.name), usually what and where the wound is.
+      - name: assessment_date
+        description: The entry's date (cmSkinAssessments.date).
+      - name: review_date
+        description: >
+          The entry's review date (cmSkinAssessments.reviewDate): the date the
+          page's window applies to, on any entry of the wound. Null on 19% of
+          care2's entries; typed years run from 1016 to 3026.
+      - name: is_healed
+        description: The entry is marked healed (healed is neither 0 nor null).
+      - name: wound_name
+        description: The page's Assessment Name column, the name of the wound's latest entry.
+      - name: wound_assessment_date
+        description: The page's Assessment Date column, the date of the wound's latest entry.
+      - name: wound_review_date
+        description: >
+          The page's Next Assessment Date column, the review date of the wound's
+          latest entry. The page appends "(N days)", the gap to the previous
+          entry's review date, and gets it wrong past a month (it reads the day
+          part of the interval only); not ported.
+      - name: is_wound_healed
+        description: >
+          The wound's latest entry is healed, and the page drops the wound: 8,920
+          of care2's 17,670 wounds on R2 PROD.
+      - name: location_key
+        description: source_key(source, location_id), the key to mart__dim_location.
+      - name: company_id
+        description: Company key (cmSkinAssessments.companyId). RLS key (with location_id).
+        tests: [not_null]
+      - name: location_id
+        description: >
+          Location key (cmSkinAssessments.locationId, else the client's location).
+          RLS key (with company_id).
+        tests: [not_null]
+
+  - name: int__task_review
+    description: >
+      Task Review report source — one row per scheduled task slot per day per
+      result recorded on it, the port of the legacy Digital Task Review page
+      (cm/in/task/companyTaskRpt.php, returnTasks() in taskFunctions.php), the task
+      twin of Medication Review. The page lists one location and one date window
+      after Search; this holds every location, the full history and 60 days ahead
+      (macros/report_horizon.sql), and the window becomes a slicer. The rules on
+      clients, empty slots, one row per result, the Carer column and the forward
+      look are those confirmed for Medication Review on 2026-10-28.
+      Measured on DEV care1 (a stale copy, results to 2025-01-15) on 2026-10-29.
+      SCHEDULES: live cmdailyTasksAssign rows with a company and a location that
+      have a cmdailyTasks row (the page's join acts as an inner one; 9 live
+      schedules have none), of a client that exists and is not deleted (state 4).
+      A deleted task type still shows (47 live schedules), as on the page. The
+      page lists only clients with statusId = 1, a status-row id; here the
+      client's state does not pick schedules, and the service spell below bounds
+      the empty slots instead. The schedule's location is the row's.
+      DATES: a schedule is expanded inside [dateStart, dateFinish], open-ended up
+      to the horizon (today + 60), over the shared calendar, which starts in 2000.
+      dateStart = dateFinish is that one date; week > 0 is the ticked weekdays
+      (mon..sun), every `week` weeks counted from the Monday of dateStart's week;
+      else everyNumDays > 0 is dateStart and every N days after; anything else is
+      every day. The page checks week BEFORE everyNumDays, the reverse of
+      Medication Review (no care1 schedule sets both). stoppedDate cuts nothing,
+      as on the page. Checked against the results the app wrote: in 2024 every
+      result of an every-7-days schedule and 99.97% of a weekly one's fall on
+      these dates.
+      SLOTS: each live cmdailyTasksAssignTimes row is a slot (assigned_time); a
+      schedule with none is a single "Any" slot. On dateFinish, a timed slot later
+      than effectiveStopTime is not due. The time row's own day list, week, every
+      N days and dates are not read, as on the page. They limit when the carer
+      app asks for the task: in 2024, 451k slots fall on a weekday outside the
+      time row's day list and 239k after the time row's own dateFinish, and only
+      556 Completed results sit on either. Those slots read as not recorded, as on
+      the page.
+      RESULTS: every live cmdailyTasksResults row, matched on schedule, client, the
+      schedule's location and dateEntered = the date; a timed slot takes the
+      results with its tasksAssignTimesId, an "Any" slot only the results with
+      none (Medication Review's "Any" slot takes every result of the day). A
+      result with an unknown taskDone still shows, its status blank, as the page
+      joins the status with a LEFT JOIN (138 care1 results carry 0). One row per
+      result, as on the page; is_latest_for_slot marks one row per slot for
+      counting (24,832 extra rows in care1). A result the page cannot see is not
+      here either: 265k recorded without tasksAssignTimesId on a schedule that has
+      times (every result of 2017-2020, so those years are all blank slots), 23k
+      outside the schedule's dates, 10k on a deleted schedule, 5k of a deleted
+      client, and 1.6k others. 6.97M of care1's 7.28M live results are here.
+      THE CLIENT'S SERVICE SPELL (int__client_service_spell) bounds the EMPTY
+      slots, as in Medication Review: a slot with nothing recorded is listed
+      only from the client's start until the day they left; a slot WITH a result
+      always is. It cuts care1's 2024 from 7.28M slots to 6.22M.
+      EMPTY SLOTS are still 38% of 2024's slots. Most belong to locations that
+      schedule tasks but record none of them digitally: one care1 location holds
+      1.24M of the 2.34M, and at least six others recorded none in 2024. The page
+      shows them as blank rows too.
+      NOT PORTED: today's placeholder row on an "Any" slot (an extra row with no
+      carer and no status in front of the first result that is not Due or
+      Cancelled, a carer-screen device); and the time period name in Assigned
+      Time, because timePeriods is not loaded into Snowflake (time_period_id waits
+      for it).
+      NO TESTS HERE: the grain and key tests sit on mart__task_review_report,
+      which holds the same rows as a table. On this view each test would expand
+      every schedule again.
+    columns:
+      - name: source
+        description: Tenant token of the source schema the row came from. Opens the grain.
+      - name: scheduled_date
+        description: The date the slot is due — the page's Date. Part of the grain.
+      - name: task_assign_id
+        description: The schedule (cmdailyTasksAssign.id). Part of the grain WITH source.
+      - name: task_schedule_key
+        description: source_key(source, task_assign_id), the key to mart__dim_task_schedule.
+      - name: task_assign_times_id
+        description: The slot's time (cmdailyTasksAssignTimes.id); null for an "Any" slot. Part of the grain.
+      - name: assigned_time
+        description: >
+          The page's Assigned Time: the slot's time as "HH:MM", or 'Any'. The page
+          shows a named time period instead where the slot has one; timePeriods is
+          not loaded, so this is always the time.
+      - name: assigned_time_minutes
+        description: Minutes after midnight of assigned_time, -1 for 'Any' — its sort key.
+      - name: time_period_id
+        description: cmdailyTasksAssignTimes.timePeriodId. No name for it until timePeriods is loaded.
+      - name: result_id
+        description: The result (cmdailyTasksResults.id); null when nothing is recorded on the slot.
+      - name: result_number
+        description: >
+          1, 2, ... in the order the slot's results were created; null for the blank
+          row of a slot with nothing recorded. Part of the grain.
+      - name: is_latest_for_slot
+        description: >
+          True on exactly one row per slot: its most recently created result, or its
+          blank row. Count slots, and the outcome of each slot, on these rows only.
+      - name: is_recorded
+        description: True when the row carries a result.
+      - name: status_id
+        description: >
+          cmdailyTasksResults.taskDone. In DEV care1: 1 Completed, 2 Other, 3
+          Partially Completed, 4 Not Completed, 5 Missed (written by the app), 6 Due
+          (written by the app), 7 Cancelled; 0 on 138 old results, which no
+          category holds.
+      - name: status_name
+        description: >
+          The page's Status: the category's name, or the company's own live name for
+          it in the schedule's location (replaceCategoryId). The page shows the
+          category's own name in the column and the company's name only in its
+          Status Search dropdown; this uses the company's name in both. Null when
+          taskDone matches no category.
+      - name: sub_status_id
+        description: cmdailyTasksResults.subTaskDone.
+      - name: sub_status_name
+        description: The page's Sub Status (cmdailyTasksReason.name).
+      - name: recorded_by_id
+        description: cmdailyTasksResults.createdBy.
+      - name: recorded_by
+        description: >
+          The page's Carer column: the name of carer row createdBy, office users and
+          deleted carers included. Null when no carer row has that id.
+      - name: time_recorded
+        description: The page's Time Recorded (cmdailyTasksResults.timeSaid), "HH:MM:SS".
+      - name: comment
+        description: The page's Comment (cmdailyTasksResults.comment).
+      - name: result_created_at
+        description: The page's Result Created (cmdailyTasksResults.created), a timestamp.
+      - name: client_id
+        description: The schedule's client (cmdailyTasksAssign.clientId).
+      - name: client_key
+        description: source_key(source, client_id), the key to mart__dim_client (name, area, workgroup, branch, state).
+      - name: area_id
+        description: >
+          The client's area (client.area as a number). Branch-level RLS key for the
+          TenantArea role; the page applies no area limit to the rows at all. Null
+          for 1.3% of care1's rows.
+      - name: location_key
+        description: source_key(source, location_id), the key to mart__dim_location.
+      - name: company_id
+        description: The schedule's company (cmdailyTasksAssign.companyId). RLS key (with location_id).
+      - name: location_id
+        description: The schedule's location (cmdailyTasksAssign.locationId) — the location the page lists. RLS key (with company_id).

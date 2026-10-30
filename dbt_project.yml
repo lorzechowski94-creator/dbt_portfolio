@@ -1,0 +1,117 @@
+name: 'care_analytics'
+version: '1.0.0'
+
+profile: 'care_analytics'
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+clean-targets:         # directories to be removed by `dbt clean`
+  - "target"
+  - "dbt_packages"
+
+# WHICH CARE A RUN BUILDS: the DBT_CARE environment variable, defaulting to care1.
+# Every care (care1/care4 in the R1 account, care2/3/5 + beta in R2 account, alpha/alpha2
+# in the R3 account — the token is the tenant's schema name, not always careN) is
+# the same MySQL schema layout, so the repo holds ONE set of models and dbt is run
+# once per care instead of carrying one copy per care:
+#   DBT_CARE=care2 dbt build --target prod_r2 --target-path target/care2
+#   $env:DBT_CARE='care2'; dbt build --target prod_r2   # PowerShell
+#
+# It MUST be an env var, not a dbt `var`. dbt renders this file with a context
+# that resolves var() against CLI --vars ONLY — it cannot see a project-level
+# `vars:` block, while models/sources.yml/macros can. Driving the care through
+# var() therefore lets the three contexts disagree silently: set it in `vars:` and
+# +schema below renders care1 while sources.yml reads CARE2, i.e. one care's rows
+# land in another care's schema. env_var() resolves identically in all three.
+#
+# Guard below: fails any BUILDING command whose care does not match the account
+# its target points at (macros/assert_care_target.sql). That macro's header also
+# carries the checklist for ADDING A NEW CARE or a new account/region — nothing
+# under models/ changes for either, so start there rather than here.
+on-run-start:
+  - "{{ assert_care_target() }}"
+
+# THE BUILD HAS TWO PHASES (macros/assert_care_target.sql has the long version):
+#   1. once per care    — access + raw_access + staging:  dbt build --exclude tag:shared
+#   2. once per account — intermediate + marts + report:  dbt build --select tag:shared
+# Phase 2's DBT_CARE is irrelevant beyond passing the guard: its models read the
+# account's care list, not $DBT_CARE. .gitlab-ci.yml runs phase 2 after the phase-1
+# loop finishes — earlier is not an error, it just reads stale cares.
+models:
+  care_analytics:
+    # raw_access and staging land in a PER-CARE schema (care1 / care2 / ...), so
+    # their object names stay bare for every care — the schema already separates
+    # them (ANALYTICS_RAW_ACCESS.CARE2.TIMESHEET, same shape as R1's CARE1).
+    # intermediate, marts and report are built ONCE PER ACCOUNT over every care at
+    # once, so they carry no care token in the name either; the care is a COLUMN on
+    # the row (models/intermediate/_int__models.yml).
+    #
+    # The row-access map (models/access/) is account-wide too, with the care as a
+    # column, and lands beside the intermediate models — but it is built in the
+    # per-care phase, ahead of the raw_access views that read it
+    # (models/access/_access__models.yml says why). A TABLE: the filter reads it
+    # once per query in owner context, and a view would re-scan every care's
+    # `location` each time. Readers get SELECT on the report schema only, so the
+    # map is unreachable to them.
+    access:
+      +database: ANALYTICS_INTERMEDIATE
+      +schema: care_management
+      +materialized: table
+    raw_access:
+      +database: ANALYTICS_RAW_ACCESS
+      +schema: "{{ env_var('DBT_CARE', 'care1') }}"
+      +materialized: view
+      +secure: true
+    staging:
+      +database: ANALYTICS_STAGING
+      +schema: "{{ env_var('DBT_CARE', 'care1') }}"
+      +materialized: view
+    # THE SEAM. These models read every care's staging relations at once
+    # (macros/union_cares.sql) and stamp each row with the care it came from (the
+    # `source` column), so from here up there is one relation per ACCOUNT, not per
+    # care.
+    intermediate:
+      +database: ANALYTICS_INTERMEDIATE
+      +schema: care_management
+      +materialized: view
+      +tags: ['shared']
+    marts:
+      +database: ANALYTICS_MART
+      +schema: care_management
+      +materialized: table
+      +tags: ['shared']
+      # Push the _mart__models.yml descriptions into Snowflake as native COMMENTs,
+      # so the mart tables document themselves in Snowsight / INFORMATION_SCHEMA
+      # instead of only inside dbt. Applied as `alter table [alter column] ...
+      # comment` at the end of each model's build — metadata only, no data rewrite,
+      # and no --full-refresh needed. Only columns that HAVE a description in the
+      # yml get one; the rest stay blank, so gaps in the yml are now visible to
+      # anyone browsing the warehouse.
+      +persist_docs:
+        relation: true
+        columns: true
+    # Customer-facing secure views over the mart tables. RLS is enforced here via
+    # customer_access_filter (secure view => predicate evaluated at query time with
+    # the reader's role). Grant customer reader roles SELECT ONLY on this schema,
+    # never on care_management (the underlying mart tables hold all customers' data).
+    report:
+      +database: ANALYTICS_MART
+      +schema: report
+      +materialized: view
+      +secure: true
+      +tags: ['shared']
+      # Same as marts: descriptions become native COMMENTs, here on the views the
+      # CUSTOMER sees — so a reader browsing the report schema gets the definitions
+      # without access to the repo. relation: true carries the model description
+      # (_report__models.yml has one per view); columns: true has nothing to persist
+      # yet, because that file documents models only — Snowflake does NOT inherit
+      # column comments from the mart table underneath, each view needs its own
+      # column entries. Left on so it starts working the moment they are added.
+      +persist_docs:
+        relation: true
+        columns: true

@@ -1,0 +1,92 @@
+# Committed profile used ONLY by the GitLab pipeline (the root profiles.yml is
+# gitignored). No stored secret. The pipeline points dbt at this file with
+# DBT_PROFILES_DIR=ci.
+#
+# Both targets authenticate as the same Snowflake SERVICE user (SVC_DBT_CI) via
+# Workload Identity Federation (OIDC) — no private key, nothing to rotate. Each
+# .gitlab-ci.yml job mints a per-job GitLab OIDC token (id_tokens: SNOWFLAKE_TOKEN,
+# aud: snowflakecomputing.com) consumed here as SNOWFLAKE_TOKEN. SVC_DBT_CI must
+# be bootstrapped in EACH account with a matching WORKLOAD_IDENTITY (ISSUER
+# https://gitlab.com, SUBJECT project_path:<this repo>) — see
+# ci/bootstrap-wif.sql. Trunk-based: both targets build from the same `main`
+# branch; only the account differs.
+#
+#   dev     -> DEV account     (MYORG-DEV)    — scheduled refresh.
+#   prod_r1 -> R1 PROD account (MYORG-PROD_R1)    — the deploy.
+#   prod_r2 -> R2 PROD account (MYORG-PROD_R2) — the deploy.
+#   prod_r3 -> R3 PROD account (MYORG-PROD_R3) — the deploy.
+#
+# Optional override: DBT_SNOWFLAKE_WAREHOUSE.
+
+care_analytics:
+  target: dev
+  outputs:
+
+    # Scheduled full refresh of the DEV account. CLEAN schemas (care1, ...) — see
+    # generate_schema_name.sql (only the local terminal sandbox, schema DBT_DEV,
+    # gets the DBT_DEV_ prefix; every other target here is clean).
+    dev:
+      type: snowflake
+      account: MYORG-DEV
+      user: SVC_DBT_CI
+      role: DBT_TRANSFORMER
+      authenticator: workload_identity
+      workload_identity_provider: OIDC
+      token: "{{ env_var('SNOWFLAKE_TOKEN', '') }}"
+      warehouse: "{{ env_var('DBT_SNOWFLAKE_WAREHOUSE', 'WH_ANALYTICS_REPORTING_XS') }}"
+      database: ANALYTICS_RAW
+      schema: DEV
+      threads: 8
+
+    # Production deploy -> the SEPARATE prod account, pinned (not env_var-driven)
+    # so it can never fall back to dev. Same SVC_DBT_CI identity, same OIDC
+    # mechanism, bootstrapped separately in this account (ci/bootstrap-wif.sql).
+    # Clean schemas (care1, care_management, ...).
+    prod_r1:
+      type: snowflake
+      account: MYORG-PROD_R1
+      user: SVC_DBT_CI
+      role: DBT_TRANSFORMER
+      authenticator: workload_identity
+      workload_identity_provider: OIDC
+      token: "{{ env_var('SNOWFLAKE_TOKEN', '') }}"
+      warehouse: "{{ env_var('DBT_SNOWFLAKE_WAREHOUSE', 'WH_ANALYTICS_REPORTING_XS') }}"
+      database: ANALYTICS_RAW
+      schema: PROD
+      threads: 8
+
+    # R2 production deploy -> the R2 prod account (MYORG-PROD_R2). Same
+    # SVC_DBT_CI / OIDC mechanism, bootstrapped separately in this account
+    # (ci/bootstrap-wif.sql). This account's ANALYTICS_RAW holds CARE2/CARE3/CARE5/BETA
+    # (no CARE1); the deploy job runs dbt once per care with DBT_CARE=<care>
+    # (see .gitlab-ci.yml dbt_deploy_prod_r2).
+    prod_r2:
+      type: snowflake
+      account: MYORG-PROD_R2
+      user: SVC_DBT_CI
+      role: DBT_TRANSFORMER
+      authenticator: workload_identity
+      workload_identity_provider: OIDC
+      token: "{{ env_var('SNOWFLAKE_TOKEN', '') }}"
+      warehouse: "{{ env_var('DBT_SNOWFLAKE_WAREHOUSE', 'WH_ANALYTICS_REPORTING_XS') }}"
+      database: ANALYTICS_RAW
+      schema: PROD
+      threads: 8
+
+    # R3 production deploy -> the R3 prod account (MYORG-PROD_R3). Same
+    # SVC_DBT_CI / OIDC mechanism, bootstrapped separately in this account
+    # (ci/bootstrap-wif.sql). This account's ANALYTICS_RAW holds ALPHA and ALPHA2 — the
+    # tenant schemas are NOT named careN here, which changes nothing: DBT_CARE
+    # carries whatever the schema is called (see macros/assert_care_target.sql).
+    prod_r3:
+      type: snowflake
+      account: MYORG-PROD_R3
+      user: SVC_DBT_CI
+      role: DBT_TRANSFORMER
+      authenticator: workload_identity
+      workload_identity_provider: OIDC
+      token: "{{ env_var('SNOWFLAKE_TOKEN', '') }}"
+      warehouse: "{{ env_var('DBT_SNOWFLAKE_WAREHOUSE', 'WH_ANALYTICS_REPORTING_XS') }}"
+      database: ANALYTICS_RAW
+      schema: PROD
+      threads: 8

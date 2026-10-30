@@ -1,0 +1,101 @@
+name: mart__task_review_report
+schema: care_management
+description: "Task Review. One row per scheduled task slot per day per result recorded on it, full history plus a 60-day forward look; a slot with nothing recorded is one blank row. Ports companyTaskRpt.php (Digital Task Review)."
+grain: "One row per source + task_assign_id + task_assign_times_id + scheduled_date + result_number"
+modelRole: transaction-fact
+rationale:
+  purpose: "The legacy page's list of scheduled task slots and what was recorded on each, for every location and date at once; the page's date window becomes a slicer. The 60 days ahead show the tasks still to come, as in Medication Review."
+  grainChoice: "The page shows one row per slot per result (a Due row and a later Completed row both show), so the grain keeps the result; is_latest_for_slot marks one row per slot so that slot counts do not overstate tasks."
+  design: "Schedules are expanded into dates and times in int__task_review, which documents the row rules and the departures from the page. Empty slots are bounded by the client's service spell; a slot with a result always shows. Names are on the row only where they belong to the result (status, sub status, who recorded it — any carer row, deleted and office users included, which mart__dim_carer does not hold). Incremental (delete+insert on scheduled_date): each run replaces every date from 60 days back up to the horizon (today + 60, macros/report_horizon.sql), so a forecast slot whose schedule has since changed does not survive."
+  measures: "No stored measure. Slot counts and outcomes are counts over is_latest_for_slot and status_id, in DAX (docs/powerbi_task_review_setup.md) and in task_review_sv (macros/create_semantic_views.sql)."
+columns:
+  - name: source
+    dataType: "VARCHAR"
+    description: "Tenant token of the source schema the row came from. Opens the grain."
+    isNaturalKey: true
+  - name: scheduled_date
+    dataType: "DATE"
+    description: "The date the slot is due — the page's Date. Part of the grain; the relationship to dim_date."
+    isNaturalKey: true
+    isForeignKey: true
+  - name: task_assign_id
+    dataType: "NUMBER(38,0)"
+    description: "The schedule (cmdailyTasksAssign.id). Part of the grain WITH source."
+    isNaturalKey: true
+  - name: task_schedule_key
+    dataType: "NUMBER(38,0)"
+    description: "Power BI relationship key to dim_task_schedule — source_key(source, task_assign_id)."
+    isForeignKey: true
+  - name: task_assign_times_id
+    dataType: "NUMBER(38,0)"
+    description: "The slot's time (cmdailyTasksAssignTimes.id); null for an \"Any\" slot. Part of the grain."
+    isNaturalKey: true
+  - name: assigned_time
+    dataType: "VARCHAR"
+    description: "The page's Assigned Time — \"HH:MM\", or 'Any'."
+  - name: assigned_time_minutes
+    dataType: "NUMBER(38,0)"
+    description: "Sort key for assigned_time — minutes after midnight, -1 for 'Any'."
+  - name: time_period_id
+    dataType: "NUMBER(38,0)"
+    description: "cmdailyTasksAssignTimes.timePeriodId; no name for it until timePeriods is loaded."
+  - name: result_id
+    dataType: "NUMBER(38,0)"
+    description: "The result (cmdailyTasksResults.id); null on the blank row of a slot with nothing recorded."
+  - name: result_number
+    dataType: "NUMBER(38,0)"
+    description: "1, 2, ... in the order the slot's results were created; null on a blank row. Part of the grain."
+    isNaturalKey: true
+  - name: is_latest_for_slot
+    dataType: "BOOLEAN"
+    description: "True on exactly one row per slot: its most recent result, or its blank row."
+  - name: is_recorded
+    dataType: "BOOLEAN"
+    description: "True when the row carries a result."
+  - name: status_id
+    dataType: "NUMBER(38,0)"
+    description: "cmdailyTasksResults.taskDone: 1 Completed, 2 Other, 3 Partially Completed, 4 Not Completed, 5 Missed, 6 Due, 7 Cancelled."
+  - name: status_name
+    dataType: "VARCHAR"
+    description: "The page's Status — the status name, or the company's own live name for it in the location."
+  - name: sub_status_id
+    dataType: "NUMBER(38,0)"
+    description: "cmdailyTasksResults.subTaskDone."
+  - name: sub_status_name
+    dataType: "VARCHAR"
+    description: "The page's Sub Status (cmdailyTasksReason.name)."
+  - name: recorded_by_id
+    dataType: "NUMBER(38,0)"
+    description: "cmdailyTasksResults.createdBy."
+  - name: recorded_by
+    dataType: "VARCHAR"
+    description: "The page's Carer column — the name of carer row createdBy, office users and deleted carers included."
+  - name: time_recorded
+    dataType: "VARCHAR"
+    description: "The page's Time Recorded (timeSaid), \"HH:MM:SS\"."
+  - name: comment
+    dataType: "VARCHAR"
+    description: "The page's Comment."
+  - name: result_created_at
+    dataType: "TIMESTAMP_NTZ"
+    description: "The page's Result Created (cmdailyTasksResults.created)."
+  - name: client_id
+    dataType: "NUMBER(38,0)"
+    description: "The schedule's client (cmdailyTasksAssign.clientId)."
+  - name: client_key
+    dataType: "NUMBER(38,0)"
+    description: "Power BI relationship key to dim_client — source_key(source, client_id). Client name, area, workgroup and branch come from there."
+    isForeignKey: true
+  - name: area_id
+    dataType: "NUMBER(38,0)"
+    description: "The client's area. Branch-level RLS key for the TenantArea role (mart__area_scope); the page limits no rows by area."
+  - name: location_key
+    dataType: "NUMBER(38,0)"
+    description: "Relationship key to mart__dim_location — source_key(source, location_id)."
+    isForeignKey: true
+  - name: company_id
+    dataType: "NUMBER(38,0)"
+    description: "The schedule's company (cmdailyTasksAssign.companyId). RLS key (with location_id)."
+  - name: location_id
+    dataType: "NUMBER(38,0)"
+    description: "The schedule's location (cmdailyTasksAssign.locationId), the one the page lists. RLS key (with company_id)."

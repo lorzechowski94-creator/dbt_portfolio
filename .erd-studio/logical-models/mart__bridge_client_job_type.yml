@@ -1,0 +1,37 @@
+name: mart__bridge_client_job_type
+schema: care_management
+description: "One row per client of mart__all_clients_report and each live job type in their client.jobTypes list (int__client_job_types). The Job Type slicer of the All Clients report."
+grain: "One row per source + client_id + job_type_id"
+modelRole: factless-fact
+rationale:
+  purpose: "client.jobTypes is a comma-separated list of job type ids; a row per id lets a slicer match a client holding ANY selected job type, without the legacy substring match on the ids (1 also finding 10, 11, 21)."
+  design: "Power BI - bridge[client_key] *:1 all_clients[client_key] with cross-filter BOTH, slicer on job_type_name. The name is on the row, as on the tag bridge, so it is not related to mart__dim_jobtype. Restricted to the report's clients, so every row finds its client; the RLS keys are the client's."
+columns:
+  - name: source
+    dataType: "VARCHAR"
+    description: "Tenant token of the source schema the row came from. Opens the grain."
+    isNaturalKey: true
+  - name: client_id
+    dataType: "NUMBER(38,0)"
+    description: "Client key. Grain with source + job_type_id. Power BI relates on client_key."
+    isNaturalKey: true
+  - name: client_key
+    dataType: "NUMBER(38,0)"
+    description: "Relationship key to mart__all_clients_report — source_key(source, client_id)."
+    isForeignKey: true
+  - name: job_type_id
+    dataType: "NUMBER(38,0)"
+    description: "Job type key (jobtype.id). Grain with source + client_id."
+    isNaturalKey: true
+  - name: job_type_key
+    dataType: "NUMBER(38,0)"
+    description: "source_key(source, job_type_id) — the same value as mart__dim_jobtype's key."
+  - name: job_type_name
+    dataType: "VARCHAR"
+    description: "Job type name (jobtype.name) — the slicer value."
+  - name: company_id
+    dataType: "NUMBER(38,0)"
+    description: "Company key, from the client. RLS key (with location_id)."
+  - name: location_id
+    dataType: "NUMBER(38,0)"
+    description: "Location key, from the client. RLS key (with company_id)."

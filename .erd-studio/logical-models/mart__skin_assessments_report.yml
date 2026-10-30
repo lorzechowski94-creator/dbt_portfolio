@@ -1,0 +1,100 @@
+name: mart__skin_assessments_report
+schema: care_management
+description: "Skin Assessments. One row per live entry of a client's wound record (cmSkinAssessments): a wound's first assessment or one of its reviews, each carrying the values of the wound's latest entry. The Wound / Skin tab of plansAssesmentRpt.php (Plan & Assessment Dates)."
+grain: "One row per source + skin_assessment_id (skin_assessment_key)"
+modelRole: transaction-fact
+rationale:
+  purpose: "The legacy tab's list of open wounds due for review in a date window, for all dates and every client state at once."
+  roleChoice: "A transaction fact: one row per assessment entry, rebuilt in full each run. It relates to mart__dim_date on review_date (the page's window) and to mart__dim_location; the client's name and state are on the row, so it relates to no person dimension."
+  grainChoice: "Entry, not wound: the page lists a wound when ANY of its entries has a review date in the window, and only entry rows can say that. The wound's latest-entry values (wound_*) are repeated on every entry, so a table of the wound_* columns shows one row per wound, and is_latest_entry = true leaves one row per wound for anything else."
+  design: "The page shows a wound by its latest live entry and drops it when that entry is healed (is_wound_healed). Only sources whose cmSkinAssessments is ingested have rows; it is read from raw_access through union_cares_present() until every care has it. Column semantics and the row set are documented on int__skin_assessments."
+columns:
+  - name: source
+    dataType: "VARCHAR"
+    description: "Tenant token of the source schema the row came from. Opens the grain."
+    isNaturalKey: true
+  - name: skin_assessment_key
+    dataType: "NUMBER(38,0)"
+    description: "source_key(source, skin_assessment_id) — unique on its own."
+    isPrimaryKey: true
+  - name: skin_assessment_id
+    dataType: "NUMBER(38,0)"
+    description: "Entry primary key (cmSkinAssessments.id). Grain WITH source — the id is allocated per care and repeats across them."
+    isNaturalKey: true
+  - name: wound_key
+    dataType: "NUMBER(38,0)"
+    description: "source_key(source, wound_id) — the wound. Distinct count = wounds."
+  - name: wound_id
+    dataType: "NUMBER(38,0)"
+    description: "The wound's first entry id (parentId, or the entry's own id on a first entry)."
+  - name: is_latest_entry
+    dataType: "BOOLEAN"
+    description: "The wound's latest live entry, the one the page shows. One per wound."
+  - name: client_id
+    dataType: "NUMBER(38,0)"
+    description: "client.id, the client the wound is on. Not unique on its own."
+  - name: client_key
+    dataType: "NUMBER(38,0)"
+    description: "source_key(source, client_id) — the same value as mart__dim_client's key."
+  - name: first_name
+    dataType: "VARCHAR"
+    description: "First name (fname)."
+  - name: surname
+    dataType: "VARCHAR"
+    description: "Surname (sname)."
+  - name: full_name
+    dataType: "VARCHAR"
+    description: "The report's Client column — first name + surname."
+  - name: client_state_id
+    dataType: "NUMBER(38,0)"
+    description: "The client's state — 1 Active, 2 Pending, 3 Archived."
+  - name: client_state
+    dataType: "VARCHAR"
+    description: "The report's Status — Active / Pending / Archived."
+  - name: area_id
+    dataType: "NUMBER(38,0)"
+    description: "The client's area id. Branch-level RLS key for the TenantArea role (mart__area_scope)."
+  - name: area_name
+    dataType: "VARCHAR"
+    description: "The client's area name. Not on the legacy tab."
+  - name: workgroup_names
+    dataType: "VARCHAR"
+    description: "The area's live workgroups, comma-joined. Display only."
+  - name: branch_names
+    dataType: "VARCHAR"
+    description: "The live branches of those workgroups, comma-joined. Display only."
+  - name: assessment_name
+    dataType: "VARCHAR"
+    description: "The entry's name."
+  - name: assessment_date
+    dataType: "DATE"
+    description: "The entry's date."
+  - name: review_date
+    dataType: "DATE"
+    description: "The entry's review date — the date relationship, the page's window (on any entry of the wound)."
+    isForeignKey: true
+  - name: is_healed
+    dataType: "BOOLEAN"
+    description: "The entry is marked healed."
+  - name: wound_name
+    dataType: "VARCHAR"
+    description: "The report's Assessment Name column — the name of the wound's latest entry."
+  - name: wound_assessment_date
+    dataType: "DATE"
+    description: "The report's Assessment Date column — the date of the wound's latest entry."
+  - name: wound_review_date
+    dataType: "DATE"
+    description: "The report's Next Assessment Date column — the review date of the wound's latest entry."
+  - name: is_wound_healed
+    dataType: "BOOLEAN"
+    description: "The wound's latest entry is healed; the page drops the wound."
+  - name: location_key
+    dataType: "NUMBER(38,0)"
+    description: "Relationship key to mart__dim_location — source_key(source, location_id)."
+    isForeignKey: true
+  - name: company_id
+    dataType: "NUMBER(38,0)"
+    description: "Company key (cmSkinAssessments.companyId). RLS key (with location_id)."
+  - name: location_id
+    dataType: "NUMBER(38,0)"
+    description: "Location key (cmSkinAssessments.locationId, else the client's location). RLS key (with company_id)."

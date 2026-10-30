@@ -1,0 +1,110 @@
+name: mart__dim_date
+schema: care_management
+description: The shared Power BI date table, one row per calendar date from 2000-01-01 through 31 Dec of the year the projection horizon (the end of the third whole month from today, macros/projection_horizon.sql) falls in. Relate every dated fact to it and mark it as the Date table in Power BI.
+grain: One row per calendar date
+modelRole: conformed-dim
+rationale:
+  purpose: One shared calendar for every dated fact — all date slicers filter this, never a fact.
+  design: >
+    The only mart with no source column - a generated calendar is identical for every tenant, so
+    report__dim_date applies no row filter either. Runs to year END (not to the horizon) because Power BI
+    time intelligence needs complete years and the continuity report's Year measures snap the
+    selection out to whole calendar years; that is why it does NOT reuse int__report_calendar, which
+    is deliberately capped at the horizon for recurrence expansion. The year is the horizon's, not
+    today's - from early November the forward-looking facts reach into next year and need their
+    dates here. No relative-date flags - they would freeze at build time; compute those in DAX.
+  grainChoice: Attributes are defined here once for every report rather than denormalised per fact — the scope is deliberately wider than any one report needs.
+columns:
+  - name: calendar_date
+    dataType: DATE
+    description: The date. Grain of the dimension; the Power BI relationship key and Date-table column.
+    isPrimaryKey: true
+    scdType: 0
+  - name: year
+    dataType: NUMBER(38,0)
+    description: Calendar year. The column the continuity report's Year measures filter on via TREATAS.
+    scdType: 0
+  - name: quarter_number
+    dataType: NUMBER(38,0)
+    description: Calendar quarter 1-4.
+    scdType: 0
+  - name: quarter_name
+    dataType: VARCHAR
+    description: Quarter label ("Q3").
+    scdType: 0
+  - name: month_number
+    dataType: NUMBER(38,0)
+    description: Month 1-12. Sort column for month_name.
+    scdType: 0
+  - name: month_name
+    dataType: VARCHAR
+    description: Full month name ("August"). Set its sort column to month_number in Power BI.
+    scdType: 0
+  - name: month_short
+    dataType: VARCHAR
+    description: Three-letter month name ("Aug").
+    scdType: 0
+  - name: year_month
+    dataType: NUMBER(38,0)
+    description: Integer YYYYMM. Sort column for month_year_label.
+    scdType: 0
+  - name: month_year_label
+    dataType: VARCHAR
+    description: Month + year label ("Aug 2026"). Set its sort column to year_month.
+    scdType: 0
+  - name: day_of_month
+    dataType: NUMBER(38,0)
+    description: Day of month 1-31.
+    scdType: 0
+  - name: day_of_year
+    dataType: NUMBER(38,0)
+    description: Day of year 1-366.
+    scdType: 0
+  - name: iso_week
+    dataType: NUMBER(38,0)
+    description: ISO week number (weekiso, 1 = Monday). Pair with iso_year, never with year.
+    scdType: 0
+  - name: iso_year
+    dataType: NUMBER(38,0)
+    description: ISO week-numbering year; differs from year around 1 January.
+    scdType: 0
+  - name: iso_year_week
+    dataType: NUMBER(38,0)
+    description: Integer YYYYWW. Sort column for iso_week_label.
+    scdType: 0
+  - name: iso_week_label
+    dataType: VARCHAR
+    description: ISO week label ("2026-W32"). Set its sort column to iso_year_week.
+    scdType: 0
+  - name: day_of_week_number
+    dataType: NUMBER(38,0)
+    description: ISO day of week (1 = Monday .. 7 = Sunday). Sort column for day_name.
+    scdType: 0
+  - name: day_name
+    dataType: VARCHAR
+    description: Full day name ("Monday"). Set its sort column to day_of_week_number.
+    scdType: 0
+  - name: day_short
+    dataType: VARCHAR
+    description: Three-letter day name ("Mon").
+    scdType: 0
+  - name: is_weekend
+    dataType: BOOLEAN
+    description: True for Saturday and Sunday.
+    scdType: 0
+  - name: start_of_month
+    dataType: DATE
+    description: First day of the date's month.
+    scdType: 0
+  - name: end_of_month
+    dataType: DATE
+    description: Last day of the date's month.
+    scdType: 0
+  - name: start_of_year
+    dataType: DATE
+    description: 1 January of the date's year.
+    scdType: 0
+  - name: end_of_year
+    dataType: DATE
+    description: 31 December of the date's year.
+    scdType: 0

@@ -1,0 +1,141 @@
+name: mart__dim_client
+schema: care_management
+description: One row per client with demographics, area/workgroup/branch, funder / care manager, referral, status, billing, service commencement and first scheduled event.
+grain: One row per source + client_id
+modelRole: conformed-dim
+rationale:
+  purpose: The client entity behind the client hours, continuity and schedule difference reports — display columns live here instead of being denormalised onto ~100M-row facts.
+  roleChoice: Conformed dimension — three facts relate to it, so it is defined once with a full attribute set rather than trimmed to any one report.
+  grainChoice: source opens the grain because client.id is allocated per care (separate MySQL databases) and repeats across them.
+columns:
+  - name: source
+    dataType: VARCHAR
+    description: Tenant token of the source schema the row came from. Opens the grain.
+    isNaturalKey: true
+    scdType: 0
+  - name: client_id
+    dataType: NUMBER(38,0)
+    description: Client primary key. Grain WITH source — the id is allocated per care and repeats across them.
+    isNaturalKey: true
+    scdType: 0
+  - name: client_key
+    dataType: NUMBER(38,0)
+    description: Power BI relationship key — source_key(source, client_id). The "one" side of every relationship into this dimension; a Power BI relationship takes ONE column and refuses duplicates, so the bare client_id cannot serve.
+    isPrimaryKey: true
+    scdType: 0
+  - name: client_no
+    dataType: VARCHAR
+    description: Front-end client display id (client.residentId). The continuity report's "Social Services Ref" column — that label is this column, not council_id.
+    scdType: 1
+  - name: first_name
+    dataType: VARCHAR
+    description: Client first name.
+    scdType: 1
+  - name: surname
+    dataType: VARCHAR
+    description: Client surname.
+    scdType: 1
+  - name: full_name
+    dataType: VARCHAR
+    description: First name + surname — the report's Name column.
+    scdType: 1
+  - name: area_id
+    dataType: NUMBER(38,0)
+    description: "Area id (client.area as a number). Branch-level RLS key: the TenantArea role keeps clients whose area belongs to one of the admin's allowed workgroups (mart__area_scope)."
+    scdType: 1
+  - name: area_name
+    dataType: VARCHAR
+    description: Area name resolved from the area hierarchy.
+    scdType: 1
+  - name: address
+    dataType: VARCHAR
+    description: Address line 1.
+    scdType: 1
+  - name: town
+    dataType: VARCHAR
+    description: Town.
+    scdType: 1
+  - name: county
+    dataType: VARCHAR
+    description: County.
+    scdType: 1
+  - name: post_code
+    dataType: VARCHAR
+    description: Post code.
+    scdType: 1
+  - name: phone
+    dataType: VARCHAR
+    description: Contact phone number.
+    scdType: 1
+  - name: email
+    dataType: VARCHAR
+    description: Email address.
+    scdType: 1
+  - name: date_of_birth
+    dataType: DATE
+    description: Client date of birth.
+    scdType: 0
+  - name: service_commencement
+    dataType: DATE
+    description: Client induction date (client.inductionDate).
+    scdType: 1
+  - name: first_scheduled_event
+    dataType: DATE
+    description: Earliest timesheet logDate ever for the client.
+    scdType: 1
+  - name: cso
+    dataType: VARCHAR
+    description: CSO. The same value as billing_code — both read clientDetails.billingCode; the legacy reports show it under two names.
+    scdType: 1
+  - name: workgroup
+    dataType: VARCHAR
+    description: Comma-joined workgroup names for the area.
+    scdType: 1
+  - name: branch
+    dataType: VARCHAR
+    description: Comma-joined branch names for the area.
+    scdType: 1
+  - name: coordinator_zone
+    dataType: VARCHAR
+    description: Coordinator zone for the area.
+    scdType: 1
+  - name: billing_code
+    dataType: VARCHAR
+    description: Billing code.
+    scdType: 1
+  - name: referral_reason
+    dataType: VARCHAR
+    description: Reason recorded on referral.
+    scdType: 1
+  - name: unit_id
+    dataType: NUMBER(38,0)
+    description: Unit key.
+    scdType: 1
+  - name: council_id
+    dataType: VARCHAR
+    description: Council id (client.councilId) — the "Council Id" column on the schedule difference report. NOT the Social Services Ref; that is client_no.
+    scdType: 1
+  - name: care_manager
+    dataType: VARCHAR
+    description: Care manager name.
+    scdType: 1
+  - name: funder
+    dataType: VARCHAR
+    description: Funder name.
+    scdType: 1
+  - name: state_id
+    dataType: NUMBER(38,0)
+    description: Client state id (1 active, 2 pending, 3 inactive). Drives the Total Deliverable fallback branch in the client hours DAX. Not exposed on the MCP semantic view — status_label is.
+    scdType: 1
+  - name: status_label
+    dataType: VARCHAR
+    description: Client state as text, the readable form of state_id. The client-status dimension on the MCP semantic view.
+    scdType: 1
+  - name: company_id
+    dataType: NUMBER(38,0)
+    description: Company key. RLS key (with location_id).
+    scdType: 1
+  - name: location_id
+    dataType: NUMBER(38,0)
+    description: Location key. RLS key (with company_id).
+    scdType: 1

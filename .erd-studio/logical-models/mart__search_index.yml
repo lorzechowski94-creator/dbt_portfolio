@@ -1,0 +1,52 @@
+name: mart__search_index
+schema: care_management
+description: Every searchable value in the account in long format — one row per entity per attribute. Backs the Power BI cross-column search box in all reports.
+grain: One row per entity key + column_ref
+modelRole: factless-fact
+rationale:
+  purpose: Power BI has no native "search every column at once" box. A text slicer over value_text plus a measure over this table reproduces the legacy DataTables search, restricted to the columns the user is currently showing.
+  design: ONE table rather than one per entity, because a text slicer filters ONE column — every searchable value has to share a single value_text, and schedule difference alone draws on dim_client, dim_carer, dim_jobtype and its own fact. One key column per entity, exactly one populated per row; a report relates only the entities it displays and its measure counts each relationship separately, then ORs the results.
+  grainChoice: One row per attribute rather than per entity, because the unit being searched is an attribute value. Which key an attribute gets is decided by the table the report's field parameter names in NAMEOF(), not by where the value physically lives.
+  measures: No measures. Read by COUNTROWS inside a visual-level filter measure. Column lists are curated by cost — a dimension attribute is one row per entity, a fact attribute one row per fact row, so only the two sparse text columns of the 112M-row schedule difference fact are indexed.
+columns:
+  - name: source
+    dataType: VARCHAR
+    description: Tenant token of the source schema the row came from.
+    isNaturalKey: true
+  - name: client_key
+    dataType: NUMBER(38,0)
+    description: Relationship key into dim_client. Populated only on rows indexing a dim_client attribute.
+    isForeignKey: true
+  - name: carer_key
+    dataType: NUMBER(38,0)
+    description: Relationship key into dim_carer. Populated only on rows indexing a dim_carer attribute.
+    isForeignKey: true
+  - name: job_type_key
+    dataType: NUMBER(38,0)
+    description: Relationship key into dim_jobtype. Populated only on rows indexing a dim_jobtype attribute.
+    isForeignKey: true
+  - name: group_key
+    dataType: NUMBER(38,0)
+    description: Relationship key into dim_jobtype_group. Populated only on rows indexing the group name, which the Client Hours Jobtype view groups by.
+    isForeignKey: true
+  - name: qualification_key
+    dataType: NUMBER(38,0)
+    description: Relationship key into mart__carer_qualification_report. Populated only on rows indexing that export's own columns, which sit on the fact because dim_carer holds none of post_code / phone / email / state / branch / workgroup.
+    isForeignKey: true
+  - name: occurrence_key
+    dataType: NUMBER(38,0)
+    description: Relationship key into mart__schedule_difference_report, copied from it. Populated only on rows indexing its two sparse cancellation text columns.
+    isForeignKey: true
+  - name: column_ref
+    dataType: VARCHAR
+    description: Join key to a report's field parameter — the physical column reference NAMEOF() stores in it, normalised to uppercase and unquoted. Keyed on the physical name rather than the display label so renaming a column in a report cannot silently drop it from search.
+    isNaturalKey: true
+  - name: value_text
+    dataType: VARCHAR
+    description: The attribute value as text, formatted the way the reports render it (dates as DD-MM-YYYY). The column the text slicer searches with "contains". Never null or empty.
+  - name: company_id
+    dataType: NUMBER(38,0)
+    description: Company key, copied from the indexed entity. RLS key (with location_id).
+  - name: location_id
+    dataType: NUMBER(38,0)
+    description: Location key, copied from the indexed entity. RLS key (with company_id).

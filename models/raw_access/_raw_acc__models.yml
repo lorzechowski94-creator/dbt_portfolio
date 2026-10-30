@@ -1,0 +1,61 @@
+# A representative sample of the raw_access layer, one model per access pattern:
+#   client     company + location filter, location column named `location`
+#   company    company-only filter (location_col=none)
+#   location   filter on the location's own id
+#   timesheet  default company + location filter; the core fact
+#   status     app-wide lookup rows under company 0 (shared_company_id=0)
+#   state      global lookup, no filter
+#
+# "1:1 passthrough" below means 1:1 on the source's own NON-SECRET columns. Every
+# view drops Airbyte's sync metadata, and the tables that carry them also lose
+# their password hashes and PINs — macros/exclude_internal.sql, whose header lists
+# them and says what this does NOT protect. Read it before adding a model here, or
+# before wondering where _airbyte_raw_id or carer.password went.
+#
+# EACH VIEW IS NAMED EXACTLY LIKE ITS RAW TABLE — ANALYTICS_RAW_ACCESS.CARE2.TAGPICK
+# over ANALYTICS_RAW.CARE2.TAGPICK, not TAG_PICK. Customers query raw_access with
+# SQL written against the source app's own table names, so a view named after our
+# snake_case model would mean rewriting every one of those queries (asked for by
+# the business, 2026-10-08). The model NAME stays snake_case for ref(); the view
+# name comes from `config(alias=...)` at the top of each model and must be the
+# source's `identifier` in models/sources.yml, lower-cased (or its name, where
+# there is none). tests/assert_raw_access_names_match_raw.sql fails if the two
+# drift, which is the check to lean on when adding a model here.
+
+version: 2
+
+models:
+  - name: raw_acc__client
+    description: >
+      Raw access view exposing the `client` source table from the care's raw schema
+      (ANALYTICS_RAW). One-to-one passthrough of the source with no transformations,
+      providing a stable, governed access layer over the raw client data.
+    columns:
+      - name: id
+        description: Unique identifier of the client.
+      - name: created
+        description: Timestamp when the client record was created in the source system.
+
+  - name: raw_acc__company
+    description: Raw access view over `company` (care raw schema). 1:1 passthrough. Company master data.
+  - name: raw_acc__location
+    description: Raw access view over `location` (care raw schema). 1:1 passthrough. Location master data.
+  - name: raw_acc__timesheet
+    description: >
+      Raw access view over `timesheet` (care raw schema). 1:1 passthrough. The core
+      transactional table — one row per scheduled/worked call. Grain of the
+      downstream timesheet report.
+    columns:
+      - name: id
+        description: Unique timesheet identifier.
+      - name: created
+        description: Timestamp when the timesheet record was created.
+  - name: raw_acc__status
+    description: >
+      Raw access view over `status` (care raw schema). Static lookup of client state
+      id -> label (type). The app's generic statuses (Active, Suspended, End of
+      Service, RIP, ...) sit under companyId 0 / locationId 0 and apply to every
+      company. Every reader of the care sees them next to its own company's statuses
+      (customer_access_filter's shared_company_id=0, asked for 2026-10-19).
+  - name: raw_acc__state
+    description: Raw access view over the global `state` lookup (care raw schema). 1:1 passthrough; no RLS filter (global reference data with no company/location columns).

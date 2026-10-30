@@ -1,0 +1,42 @@
+name: mart__bridge_jobtype_group
+schema: care_management
+description: One row per (group, job type) pair, exploded from the comma-separated jobtypeGroupName.jobTypeList with SPLIT_TO_TABLE. Resolves the group -> raw-ids many-to-many so a group slicer can filter facts that only carry job_type_id.
+grain: One row per source + group_id + job_type_id
+modelRole: factless-fact
+rationale:
+  purpose: Lets a group slicer filter the jobtype-grained facts, which carry only job_type_id.
+  design: >
+    Power BI - dim_jobtype_group[group_key] 1:* bridge, bridge[job_type_key] *:1
+    dim_jobtype[job_type_key] with cross-filter BOTH; hide every bridge column (job_type_id is the
+    very same raw id as on the fact - a join key, not a slicer value). Ids absent from dim_jobtype
+    (deleted job types, stale list entries) are dropped. The facts' NO_JOB_TYPE (-1) row belongs to
+    no group, so a group selection excludes it. The relationships tests run on the *_key columns so
+    they check the care as well - a single-column test on the bare id would pass on a pair that
+    exists only in ANOTHER care.
+columns:
+  - name: source
+    dataType: VARCHAR
+    description: Tenant token of the source schema the row came from, carried from the group. Opens the grain and both Power BI relationships.
+    isNaturalKey: true
+  - name: group_id
+    dataType: NUMBER(38,0)
+    description: Group key. Grain with source + job_type_id. Power BI relates on group_key.
+    isNaturalKey: true
+  - name: job_type_id
+    dataType: NUMBER(38,0)
+    description: Job type key — one exploded jobTypeList token. Grain with source + group_id. Power BI relates on job_type_key.
+    isNaturalKey: true
+  - name: group_key
+    dataType: NUMBER(38,0)
+    description: Power BI relationship key to dim_jobtype_group — source_key(source, group_id). The "many" side of that relationship.
+    isForeignKey: true
+  - name: job_type_key
+    dataType: NUMBER(38,0)
+    description: Power BI relationship key to dim_jobtype — source_key(source, job_type_id). The bridge's side of the *:1 relationship into the job type dimension.
+    isForeignKey: true
+  - name: company_id
+    dataType: NUMBER(38,0)
+    description: Company key carried from the group. RLS key (with location_id).
+  - name: location_id
+    dataType: NUMBER(38,0)
+    description: Location key carried from the group. RLS key (with company_id).

@@ -1,0 +1,91 @@
+name: mart__anniversary_report
+schema: care_management
+description: Anniversary Report. One row per carer with a usable employment start date; flat list, no aggregation and no totals row. Ports anniversary.php.
+grain: One row per source + carer_id (carer_key)
+modelRole: domain-dim
+rationale:
+  purpose: A flat carer list, not an aggregate — the report shows rows, never measures.
+  roleChoice: Stands alone in the star, like mart__birthday_report. carer_key would relate it to mart__dim_carer, but the list needs nothing from it and dim_carer drops deleted carers this report keeps. Its date window is a Power BI filter over next_anniversary_date rather than a dim_date join, and that filter wraps across 31 December, unlike the source's dateFrom/dateTo.
+  design: State is a slicer rather than the source's GET parameter. Date-relative columns (days_to_go, years_active, years_at_next_anniversary) are evaluated at build time; start_date, start_month and start_day are stable if a same-day figure is needed in DAX. Column semantics are documented on int__carer_anniversaries.
+columns:
+  - name: source
+    dataType: VARCHAR
+    description: Tenant token of the source schema the row came from. Opens the grain.
+    isNaturalKey: true
+  - name: carer_key
+    dataType: NUMBER(38,0)
+    description: source_key(source, carer_id) — unique on its own, so the one column that identifies a row across the account. Same value as mart__dim_carer's key for the same carer.
+    isPrimaryKey: true
+  - name: carer_id
+    dataType: NUMBER(38,0)
+    description: Carer primary key (carer.id). Grain WITH source — the id is allocated per care and repeats across them.
+    isNaturalKey: true
+  - name: title
+    dataType: VARCHAR
+    description: Salutation; often blank.
+  - name: first_name
+    dataType: VARCHAR
+    description: First name (fname).
+  - name: surname
+    dataType: VARCHAR
+    description: Surname (sname).
+  - name: full_name
+    dataType: VARCHAR
+    description: The report's Name column — title + first name + surname.
+  - name: start_date
+    dataType: DATE
+    description: The report's Start Date column (carer.startDate), bounded to 1900-01-01 .. build date.
+  - name: start_month
+    dataType: NUMBER(38,0)
+    description: Month of the start date (1-12).
+  - name: start_day
+    dataType: NUMBER(38,0)
+    description: Day of month of the start date (1-31).
+  - name: anniversary_this_year
+    dataType: DATE
+    description: Anniversary in the current calendar year; may be in the past, null for a carer who started this year.
+  - name: next_anniversary_date
+    dataType: DATE
+    description: Next anniversary on or after the build date — the report's date filter. Never the start date itself.
+  - name: days_to_go
+    dataType: NUMBER(38,0)
+    description: The report's Days To Go value; 0 = today, never negative. Default sort, ascending.
+  - name: years_active
+    dataType: NUMBER(38,0)
+    description: The report's Years Active column — completed years as at the build date, not at the upcoming anniversary.
+  - name: years_at_next_anniversary
+    dataType: NUMBER(38,0)
+    description: Which anniversary next_anniversary_date is (1 = first).
+  - name: gender
+    dataType: VARCHAR
+    description: The report's Gender column (sex), free text in the source.
+  - name: email
+    dataType: VARCHAR
+    description: The report's Email column; null when blank.
+  - name: area_id
+    dataType: NUMBER(38,0)
+    description: "The carer's area id (carer.area as a number). Branch-level RLS key: the TenantArea role keeps rows whose area belongs to one of the admin's allowed workgroups (mart__area_scope)."
+  - name: area_name
+    dataType: VARCHAR
+    description: The report's Area column; null when carer.area matches no area.
+  - name: workgroup
+    dataType: VARCHAR
+    description: Comma-joined workgroup names for the area.
+  - name: branch
+    dataType: VARCHAR
+    description: Comma-joined branch names for the area.
+  - name: state_id
+    dataType: NUMBER(38,0)
+    description: Raw state code — 1 Active, 2 Pending, 3 Archived.
+  - name: state
+    dataType: VARCHAR
+    description: The report's State column — Active / Pending / Archived.
+  - name: person_type_label
+    dataType: VARCHAR
+    description: The report's Type column — always 'Carer'.
+  - name: company_id
+    dataType: NUMBER(38,0)
+    description: Company key. RLS key (with location_id).
+  - name: location_id
+    dataType: NUMBER(38,0)
+    description: Location key. RLS key (with company_id).

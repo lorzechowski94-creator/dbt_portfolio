@@ -1,0 +1,9 @@
+# Dev-only tooling (linting). Install with: pip install -r requirements-dev.txt
+# SQLFluff uses the jinja templater (see .sqlfluff), so no dbt templater plugin
+# and no warehouse connection are needed to lint.
+-r requirements.txt
+sqlfluff==3.3.1
+# Pin chardet < 6: sqlfluff/diff_cover pull it in transitively, but requests
+# (used by dbt & the Snowflake connector) only recognizes chardet < 6.0.0.
+# Newer chardet triggers a harmless RequestsDependencyWarning on every run.
+chardet<6

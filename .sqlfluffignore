@@ -1,0 +1,7 @@
+target/
+dbt_packages/
+logs/
+analyses/
+macros/
+snapshots/
+ci/

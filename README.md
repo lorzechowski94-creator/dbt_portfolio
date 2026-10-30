@@ -1,1 +1,108 @@
-# dbt_portfolio
+# care_analytics
+
+A multi-tenant dbt project on Snowflake that turns the operational MySQL database of a
+home-care management application (scheduling, timesheets, carers, clients, care plans,
+assessments) into a governed reporting layer. It replaces a set of legacy PHP reports
+with Power BI Embedded reports and Snowflake semantic views.
+
+> Company names, Snowflake account identifiers and regions are anonymised (`MYORG-*`,
+> `R1` / `R2` / `R3`, tenant names). The code logic is unchanged.
+>
+> The `raw_access` and `staging` layers are trimmed to six representative tables
+> (client, company, location, timesheet, status, state), each showing a different
+> access-filter pattern. The original project has about 140 raw_access and 50 staging
+> models with the same shape. The intermediate, mart and report layers are complete.
+> They read the full set of per-care staging relations by name through `union_cares()`.
+
+## Highlights
+
+- **One model set, many tenants.** Each tenant ("care") is a MySQL schema with the same
+  layout. The repo holds one set of models, and dbt runs once per care, selected by the
+  `DBT_CARE` environment variable. No per-tenant copies of the models exist.
+- **Two-phase build.** Per-care layers (`raw_access`, `staging`) build into one schema
+  per care. Account-wide layers (`intermediate`, `marts`, `report`) are then built once
+  over every care at once, and the care becomes a `source` column.
+- **Schema-drift-tolerant unions.** [`union_cares`](macros/union_cares.sql) reads each
+  care's columns from the warehouse and aligns the `UNION ALL` branches by column
+  name, not position. A column that one care lacks becomes a typed `NULL`.
+- **Single source of truth for topology.** [`source_topology`](macros/source_topology.sql)
+  defines which tenants exist and which Snowflake account holds them. The build guard,
+  the union layer and the semantic views all read it, so they cannot drift apart.
+- **Fail-fast guard.** [`assert_care_target`](macros/assert_care_target.sql) runs as an
+  `on-run-start` hook. It refuses any building command whose care is not held by the
+  target's account, before a single relation is created.
+- **Row-level security without Enterprise features.** Secure views call
+  [`customer_access_filter`](macros/customer_access_filter.sql), which checks a
+  role-to-(tenant, company, location) map built by dbt
+  ([`meta_customer_role_map`](models/access/meta_customer_role_map.sql)).
+- **Credential scrubbing.** [`exclude_internal`](macros/exclude_internal.sql) drops
+  password hashes, PINs and Airbyte sync metadata from every passthrough view. It
+  resolves the column list against the warehouse, so drifted tables do not break.
+  It also restores MySQL column types (see [`mysql_types`](macros/mysql_types.sql)).
+- **Semantic layer.** [`create_semantic_views`](macros/create_semantic_views.sql) builds
+  Snowflake semantic views over the report layer for an MCP / natural-language
+  interface.
+- **CI/CD.** GitLab CI (`.gitlab-ci.yml`) authenticates to Snowflake with OIDC
+  workload identity federation, so no stored secrets are needed. It parses every
+  care's rendering on each merge request, lints SQL with SQLFluff, and deploys
+  per account.
+
+## Layers
+
+| Layer | Database | Schema | Materialisation | Built |
+|---|---|---|---|---|
+| `access` | `ANALYTICS_INTERMEDIATE` | `care_management` | table | per care (account-wide content) |
+| `raw_access` | `ANALYTICS_RAW_ACCESS` | `<care>` | secure view | per care |
+| `staging` | `ANALYTICS_STAGING` | `<care>` | view | per care |
+| `intermediate` | `ANALYTICS_INTERMEDIATE` | `care_management` | view | per account |
+| `marts` | `ANALYTICS_MART` | `care_management` | table / incremental | per account |
+| `report` | `ANALYTICS_MART` | `report` | secure view | per account |
+
+Readers are granted `SELECT` on the `report` schema only. The mart tables underneath
+hold every customer's rows.
+
+```
+ANALYTICS_RAW.<CARE>  (Airbyte, outside dbt)
+        │
+        ▼
+raw_access ──► staging ─────────────┐   phase 1: once per care  (--exclude tag:shared)
+                                    │
+                    union_cares() ◄─┘   the seam: care becomes the `source` column
+                         │
+                         ▼
+             intermediate ──► marts ──► report   phase 2: once per account (--select tag:shared)
+                                          │
+                                          ├──► Power BI Embedded (RLS via customData)
+                                          └──► Snowflake semantic views (MCP)
+```
+
+## Repository layout
+
+```
+models/
+  access/        row-access role map
+  raw_access/    1:1 secure passthroughs over the raw tables, with RLS (sample)
+  staging/       deduplicated sources (sample)
+  intermediate/  business logic, account-wide
+  marts/         dimensions, bridges and report facts
+  report/        customer-facing secure views over the marts
+macros/          topology, union, RLS, typing, semantic views, naming
+tests/           singular and generic tests
+ci/              CI profile and Snowflake OIDC bootstrap
+docs/            Power BI measure / setup notes and semantic-view metrics
+.erd-studio/     logical data model of the mart layer
+```
+
+## Running locally
+
+```bash
+pip install -r requirements-dev.txt
+cp profiles.example.yml profiles.yml        # then set DBT_SNOWFLAKE_* env vars
+
+# phase 1, once per care
+DBT_CARE=care1 dbt build --exclude tag:shared --target-path target/care1
+# phase 2, once per account
+dbt build --select tag:shared
+
+sqlfluff lint models macros
+```

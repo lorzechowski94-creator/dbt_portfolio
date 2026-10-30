@@ -1,0 +1,98 @@
+name: mart__client_hours_report
+schema: care_management
+description: Client hours per client per service date PER JOB TYPE, full history plus a 60-day forward look (macros/report_horizon.sql). The single fact behind BOTH client hours reports.
+grain: One row per client_key + service_date + job_type_key
+modelRole: periodic-snapshot
+rationale:
+  purpose: Power BI filters by date and aggregates to one row per client (Client Hours) or one row per client x job type (Client Hours by Job Type). Leaving job type off a visual sums the job type rows back to the exact client total, so there is no client-level sibling fact.
+  grainChoice: Job type stays on the grain because every pillar carries one; -1 means the source never recorded one.
+  measures: Thin additive numeric fact. The non-additive report figures (Non-Delivered excl, A v S, Billable Schedule, Billable v Confirmed, Total Deliverable, HH:MM) are DAX measures over these columns, never stored.
+  design: Demographics are in mart__dim_client, the JobType name in mart__dim_jobtype, group filtering via mart__bridge_jobtype_group. Incremental (delete+insert on service_date) - each run replaces every date from 60 days back up to the horizon, so a forecast row whose schedule has since changed does not survive; older backfills need --full-refresh.
+columns:
+  - name: source
+    dataType: VARCHAR
+    description: Tenant token of the source schema the row came from. Opens the grain, and part of every relationship to a dimension.
+    isNaturalKey: true
+  - name: service_date
+    dataType: DATE
+    description: Service date (logDate / occurrence date / recurrDate). Part of the grain; the Power BI date filter and the relationship to dim_date.
+    isNaturalKey: true
+    isForeignKey: true
+  - name: client_key
+    dataType: NUMBER(38,0)
+    description: Power BI relationship key to dim_client — source_key(source, client_id). A relationship takes ONE column and client_id alone repeats across cares, so relating on the bare id would join one care's client to another's.
+    isForeignKey: true
+    isNaturalKey: true
+  - name: job_type_key
+    dataType: NUMBER(38,0)
+    description: Power BI relationship key to dim_jobtype — source_key(source, job_type_id). The NO_JOB_TYPE bucket yields source_key(source, -1), which matches no dim_jobtype row and lands on the blank member.
+    isForeignKey: true
+    isNaturalKey: true
+  - name: allocated_hrs
+    dataType: NUMBER(38,6)
+    description: Contracted hours (cmAssignedHours) on the date for this job type.
+    additiveType: additive
+  - name: total_scheduled_hrs
+    dataType: NUMBER(38,6)
+    description: Scheduled event hours minus unpaid breaks on the date for this job type.
+    additiveType: additive
+  - name: scheduled_unassigned_hrs
+    dataType: NUMBER(38,6)
+    description: Scheduled hours with no assigned carer (carerId = 0, statusId = 1).
+    additiveType: additive
+  - name: scheduled_event_hrs_all
+    dataType: NUMBER(38,6)
+    description: Raw scheduled event hours (no break deduction) — feeds the Total Scheduled HH:MM measure.
+    additiveType: additive
+  - name: non_delivered_incl_cancelled_hrs
+    dataType: NUMBER(38,6)
+    description: statusChangeEventsRemoved eventMinutes / 60 on the date, split by job type. Deviation from legacy, which ignored the source jobType column and repeated one client-level total on every job type row.
+    additiveType: additive
+  - name: cancelled_timesheet_billed_hrs
+    dataType: NUMBER(38,6)
+    description: Cancelled timesheet hours, billed (timeType='Cancelled', dontBill=0).
+    additiveType: additive
+  - name: cancelled_timesheet_not_billed_hrs
+    dataType: NUMBER(38,6)
+    description: Cancelled timesheet hours, not billed (timeType='Cancelled', dontBill=1).
+    additiveType: additive
+  - name: confirmed_payable_hrs
+    dataType: NUMBER(38,6)
+    description: Confirmed payable timesheet hours (all types) — feeds Total Confirmed + its HH:MM measure.
+    additiveType: additive
+  - name: total_confirmed_billed_hrs
+    dataType: NUMBER(38,6)
+    description: confirmed_payable minus not-billed cancellations.
+    additiveType: additive
+  - name: total_actual_time_hrs
+    dataType: NUMBER(38,6)
+    description: Physical clock duration where timeType IS NULL.
+    additiveType: additive
+  - name: schedule_difference_hrs
+    dataType: NUMBER(38,6)
+    description: Allocated minus Total Confirmed (Billed).
+    additiveType: additive
+  - name: breaks_paid_scheduled_hrs
+    dataType: NUMBER(38,6)
+    description: Paid scheduled break hours for assigned events.
+    additiveType: additive
+  - name: breaks_unpaid_scheduled_hrs
+    dataType: NUMBER(38,6)
+    description: Unpaid scheduled break hours for assigned events.
+    additiveType: additive
+  - name: breaks_paid_scheduled_unassigned_hrs
+    dataType: NUMBER(38,6)
+    description: Paid scheduled break hours for unassigned events.
+    additiveType: additive
+  - name: breaks_unpaid_scheduled_unassigned_hrs
+    dataType: NUMBER(38,6)
+    description: Unpaid scheduled break hours for unassigned events.
+    additiveType: additive
+  - name: breaks_paid_confirmed_hrs
+    dataType: NUMBER(38,6)
+    description: Paid confirmed break hours (timesheet.tea, teaPay = 1).
+    additiveType: additive
+  - name: breaks_unpaid_confirmed_hrs
+    dataType: NUMBER(38,6)
+    description: Unpaid confirmed break hours (timesheet.tea, teaPay <> 1).
+    additiveType: additive

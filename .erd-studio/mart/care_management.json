@@ -1,0 +1,455 @@
+{
+  "schemaVersion": 5,
+  "domain": "care_management",
+  "layer": "marts",
+  "description": "Account-wide star schema in ANALYTICS.care_management: report facts over shared dimensions, plus the bridges their slicers need. Every relationship runs on a *_key column (care and id packed into one integer), never on the bare id — ids are allocated per care and repeat across them. mart__dim_date is the only model without a source column (the care). mart__area_scope stands alone: an id bridge read only by the TenantArea RLS role, related to nothing. mart__all_carers_report keeps Pending and Archived carers, so it relates to its own two bridges (and to mart__dim_location), not to mart__dim_carer. mart__all_clients_report likewise relates to its own three bridges (and to mart__dim_location), not to mart__dim_client.",
+  "modelFolder": "models/marts",
+  "logical": {
+    "models": [
+      "mart__dim_client",
+      "mart__dim_carer",
+      "mart__dim_jobtype",
+      "mart__dim_jobtype_group",
+      "mart__dim_hrfile",
+      "mart__dim_date",
+      "mart__bridge_jobtype_group",
+      "mart__client_hours_report",
+      "mart__carer_hours_report",
+      "mart__continuity_report",
+      "mart__schedule_difference_report",
+      "mart__carer_qualification_report",
+      "mart__birthday_report",
+      "mart__anniversary_report",
+      "mart__plans_taken_report",
+      "mart__assessments_report",
+      "mart__skin_assessments_report",
+      "mart__task_review_report",
+      "mart__dim_task_schedule",
+      "mart__search_index",
+      "mart__dim_location",
+      "mart__workforce_capacity",
+      "mart__workforce_movement",
+      "mart__area_scope",
+      "mart__all_carers_report",
+      "mart__bridge_carer_tag",
+      "mart__bridge_carer_workgroup",
+      "mart__all_clients_report",
+      "mart__bridge_client_tag",
+      "mart__bridge_client_workgroup",
+      "mart__bridge_client_job_type"
+    ],
+    "relationships": [
+      {
+        "fromModel": "mart__client_hours_report",
+        "fromColumn": "client_key",
+        "toModel": "mart__dim_client",
+        "toColumn": "client_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__client_hours_report",
+        "fromColumn": "job_type_key",
+        "toModel": "mart__dim_jobtype",
+        "toColumn": "job_type_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__client_hours_report",
+        "fromColumn": "service_date",
+        "toModel": "mart__dim_date",
+        "toColumn": "calendar_date",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__carer_hours_report",
+        "fromColumn": "carer_key",
+        "toModel": "mart__dim_carer",
+        "toColumn": "carer_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__carer_hours_report",
+        "fromColumn": "job_type_key",
+        "toModel": "mart__dim_jobtype",
+        "toColumn": "job_type_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__carer_hours_report",
+        "fromColumn": "service_date",
+        "toModel": "mart__dim_date",
+        "toColumn": "calendar_date",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__continuity_report",
+        "fromColumn": "client_key",
+        "toModel": "mart__dim_client",
+        "toColumn": "client_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__continuity_report",
+        "fromColumn": "carer_key",
+        "toModel": "mart__dim_carer",
+        "toColumn": "carer_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__continuity_report",
+        "fromColumn": "service_date",
+        "toModel": "mart__dim_date",
+        "toColumn": "calendar_date",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__schedule_difference_report",
+        "fromColumn": "client_key",
+        "toModel": "mart__dim_client",
+        "toColumn": "client_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__schedule_difference_report",
+        "fromColumn": "carer_key",
+        "toModel": "mart__dim_carer",
+        "toColumn": "carer_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__schedule_difference_report",
+        "fromColumn": "job_type_key",
+        "toModel": "mart__dim_jobtype",
+        "toColumn": "job_type_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__schedule_difference_report",
+        "fromColumn": "occurrence_date",
+        "toModel": "mart__dim_date",
+        "toColumn": "calendar_date",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__carer_qualification_report",
+        "fromColumn": "carer_key",
+        "toModel": "mart__dim_carer",
+        "toColumn": "carer_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__carer_qualification_report",
+        "fromColumn": "hr_file_key",
+        "toModel": "mart__dim_hrfile",
+        "toColumn": "hr_file_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__bridge_jobtype_group",
+        "fromColumn": "group_key",
+        "toModel": "mart__dim_jobtype_group",
+        "toColumn": "group_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__bridge_jobtype_group",
+        "fromColumn": "job_type_key",
+        "toModel": "mart__dim_jobtype",
+        "toColumn": "job_type_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__search_index",
+        "fromColumn": "client_key",
+        "toModel": "mart__dim_client",
+        "toColumn": "client_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__search_index",
+        "fromColumn": "carer_key",
+        "toModel": "mart__dim_carer",
+        "toColumn": "carer_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__search_index",
+        "fromColumn": "job_type_key",
+        "toModel": "mart__dim_jobtype",
+        "toColumn": "job_type_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__search_index",
+        "fromColumn": "qualification_key",
+        "toModel": "mart__carer_qualification_report",
+        "toColumn": "qualification_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__search_index",
+        "fromColumn": "occurrence_key",
+        "toModel": "mart__schedule_difference_report",
+        "toColumn": "occurrence_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__search_index",
+        "fromColumn": "group_key",
+        "toModel": "mart__dim_jobtype_group",
+        "toColumn": "group_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__workforce_capacity",
+        "fromColumn": "location_key",
+        "toModel": "mart__dim_location",
+        "toColumn": "location_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__workforce_capacity",
+        "fromColumn": "calendar_date",
+        "toModel": "mart__dim_date",
+        "toColumn": "calendar_date",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__workforce_movement",
+        "fromColumn": "location_key",
+        "toModel": "mart__dim_location",
+        "toColumn": "location_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__workforce_movement",
+        "fromColumn": "calendar_date",
+        "toModel": "mart__dim_date",
+        "toColumn": "calendar_date",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__plans_taken_report",
+        "fromColumn": "location_key",
+        "toModel": "mart__dim_location",
+        "toColumn": "location_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__plans_taken_report",
+        "fromColumn": "started_date",
+        "toModel": "mart__dim_date",
+        "toColumn": "calendar_date",
+        "cardinality": "many-to-one",
+        "role": "started"
+      },
+      {
+        "fromModel": "mart__plans_taken_report",
+        "fromColumn": "completed_date",
+        "toModel": "mart__dim_date",
+        "toColumn": "calendar_date",
+        "cardinality": "many-to-one",
+        "role": "completed"
+      },
+      {
+        "fromModel": "mart__plans_taken_report",
+        "fromColumn": "review_date",
+        "toModel": "mart__dim_date",
+        "toColumn": "calendar_date",
+        "cardinality": "many-to-one",
+        "role": "review"
+      },
+      {
+        "fromModel": "mart__assessments_report",
+        "fromColumn": "location_key",
+        "toModel": "mart__dim_location",
+        "toColumn": "location_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__assessments_report",
+        "fromColumn": "next_assessment_date",
+        "toModel": "mart__dim_date",
+        "toColumn": "calendar_date",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__skin_assessments_report",
+        "fromColumn": "location_key",
+        "toModel": "mart__dim_location",
+        "toColumn": "location_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__skin_assessments_report",
+        "fromColumn": "review_date",
+        "toModel": "mart__dim_date",
+        "toColumn": "calendar_date",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__task_review_report",
+        "fromColumn": "task_schedule_key",
+        "toModel": "mart__dim_task_schedule",
+        "toColumn": "task_schedule_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__task_review_report",
+        "fromColumn": "client_key",
+        "toModel": "mart__dim_client",
+        "toColumn": "client_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__task_review_report",
+        "fromColumn": "scheduled_date",
+        "toModel": "mart__dim_date",
+        "toColumn": "calendar_date",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__task_review_report",
+        "fromColumn": "location_key",
+        "toModel": "mart__dim_location",
+        "toColumn": "location_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__bridge_carer_tag",
+        "fromColumn": "carer_key",
+        "toModel": "mart__all_carers_report",
+        "toColumn": "carer_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__bridge_carer_workgroup",
+        "fromColumn": "carer_key",
+        "toModel": "mart__all_carers_report",
+        "toColumn": "carer_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__all_carers_report",
+        "fromColumn": "location_key",
+        "toModel": "mart__dim_location",
+        "toColumn": "location_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__bridge_client_tag",
+        "fromColumn": "client_key",
+        "toModel": "mart__all_clients_report",
+        "toColumn": "client_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__bridge_client_workgroup",
+        "fromColumn": "client_key",
+        "toModel": "mart__all_clients_report",
+        "toColumn": "client_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__bridge_client_job_type",
+        "fromColumn": "client_key",
+        "toModel": "mart__all_clients_report",
+        "toColumn": "client_key",
+        "cardinality": "many-to-one"
+      },
+      {
+        "fromModel": "mart__all_clients_report",
+        "fromColumn": "location_key",
+        "toModel": "mart__dim_location",
+        "toColumn": "location_key",
+        "cardinality": "many-to-one"
+      }
+    ]
+  },
+  "viewConfig": {
+    "showFkEdges": true,
+    "layoutOptions": {
+      "elk.algorithm": "layered",
+      "elk.direction": "RIGHT"
+    },
+    "positions": {
+      "mart__dim_client": {
+        "x": 1738,
+        "y": 1527
+      },
+      "mart__dim_carer": {
+        "x": 1509,
+        "y": 1048
+      },
+      "mart__dim_jobtype": {
+        "x": 1587,
+        "y": 607
+      },
+      "mart__dim_jobtype_group": {
+        "x": 1178,
+        "y": 866
+      },
+      "mart__dim_hrfile": {
+        "x": 1509,
+        "y": 47
+      },
+      "mart__dim_date": {
+        "x": 1613,
+        "y": 2949
+      },
+      "mart__bridge_jobtype_group": {
+        "x": 758,
+        "y": 700
+      },
+      "mart__client_hours_report": {
+        "x": 312,
+        "y": 1878
+      },
+      "mart__carer_hours_report": {
+        "x": 694,
+        "y": 1035
+      },
+      "mart__continuity_report": {
+        "x": 1091,
+        "y": 2398
+      },
+      "mart__schedule_difference_report": {
+        "x": 1103,
+        "y": 1507
+      },
+      "mart__carer_qualification_report": {
+        "x": 1080,
+        "y": 23
+      },
+      "mart__birthday_report": {
+        "x": 232,
+        "y": -9
+      },
+      "mart__search_index": {
+        "x": 2020,
+        "y": 820
+      },
+      "mart__anniversary_report": {
+        "x": 740,
+        "y": 100
+      },
+      "mart__workforce_capacity": {
+        "x": 1060,
+        "y": 2740
+      },
+      "mart__workforce_movement": {
+        "x": 1700,
+        "y": 2260
+      },
+      "mart__dim_location": {
+        "x": 2020,
+        "y": 2500
+      },
+      "mart__area_scope": {
+        "x": 2020,
+        "y": 100
+      }
+    },
+    "annotations": []
+  }
+}

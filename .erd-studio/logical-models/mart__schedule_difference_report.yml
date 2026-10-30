@@ -1,0 +1,89 @@
+name: mart__schedule_difference_report
+schema: care_management
+description: Schedule Difference Report, one row per individual scheduled call occurrence, comparing the scheduled template against the matched timesheet (early/late, worked vs scheduled, timesheet status, cancellation info). Ports scheduleReport_diff.php.
+grain: One row per source + recurr_id + occurrence_date
+modelRole: transaction-fact
+rationale:
+  purpose: Call-level detail over the full history plus a 60-day forward look (macros/report_horizon.sql); Power BI filters by date and job type. A future call has no timesheet yet, so its timesheet status is 'None'.
+  design: Display names are NOT on the row — at ~100M rows each denormalised name was the bulk of the table, so client/carer/job type names come from the dimensions. Power BI setup, the display format for time_diff_minutes and the legacy-fidelity notes are in docs/powerbi_schedule_difference_measures.md. Incremental (delete+insert on occurrence_date) - each run replaces every date from 60 days back up to the horizon, so a call since removed from the schedule does not survive.
+  measures: No stored measures — early_late_minutes and time_diff_minutes are per-row facts that DAX averages; early_late is their display twin.
+columns:
+  - name: source
+    dataType: VARCHAR
+    description: Tenant token of the source schema the row came from. Opens the grain, and part of every relationship except dim_date.
+    isNaturalKey: true
+  - name: recurr_id
+    dataType: NUMBER(38,0)
+    description: Source recurr id. Part of the grain (source + recurr_id + occurrence_date).
+    isNaturalKey: true
+  - name: occurrence_date
+    dataType: DATE
+    description: The individual expanded call date. Part of the grain; the Power BI date filter and the relationship to dim_date.
+    isNaturalKey: true
+    isForeignKey: true
+  - name: status_id
+    dataType: NUMBER(38,0)
+    description: recurr.statusId (1 = active, 2 = cancelled).
+  - name: occurrence_key
+    dataType: NUMBER(38,0)
+    description: Row key — the grain packed into one integer, source_code * 10^15 + recurr_id * 10^5 + days since 1900-01-01. The "one" side for mart__search_index, which needs a single unique column and this fact has none.
+    isPrimaryKey: true
+  - name: client_key
+    dataType: NUMBER(38,0)
+    description: Power BI relationship key to dim_client — source_key(source, client_id). The relationships test runs here rather than on the bare id, so it checks the care as well.
+    isForeignKey: true
+  - name: carer_key
+    dataType: NUMBER(38,0)
+    description: Power BI relationship key to dim_carer — source_key(source, carer_id). The relationships test is a WARNING - this fact admits carers by state (1/2/3) while dim_carer requires permissionId = 4 and deleted IS NULL.
+    isForeignKey: true
+  - name: job_type_key
+    dataType: NUMBER(38,0)
+    description: Power BI relationship key to dim_jobtype — source_key(source, job_type_id). The -1 bucket matches no dimension row, so the test excludes it; it also warns rather than errors because dim_jobtype filters deleted job types out.
+    isForeignKey: true
+  - name: schedule_start
+    dataType: VARCHAR
+    description: Scheduled start time "HH:MM".
+  - name: schedule_finish
+    dataType: VARCHAR
+    description: Scheduled finish time "HH:MM" ('00:00' -> '24:00').
+  - name: clocked_in
+    dataType: VARCHAR
+    description: Actual clock-in "HH:MM"; empty if no timesheet or still clocked in.
+  - name: clocked_out
+    dataType: VARCHAR
+    description: Actual clock-out "HH:MM"; empty if no timesheet or status='In'.
+  - name: early_late_minutes
+    dataType: NUMBER(38,0)
+    description: Actual logIn - scheduled start in minutes (+ late, - early); NULL if no timesheet. Numeric twin of early_late — feeds the On Time % / Avg Early-Late measures.
+    additiveType: non-additive
+  - name: early_late
+    dataType: VARCHAR
+    description: Early / Late as the legacy report displays it ('On time' / '+15' / '- 10'); NULL if no timesheet. Put this on the table visual, early_late_minutes in the measures.
+  - name: scheduled_time
+    dataType: VARCHAR
+    description: Scheduled event duration "HH:MM".
+  - name: worked_time
+    dataType: VARCHAR
+    description: Actual worked duration "HH:MM"; empty if no timesheet or status='In'.
+  - name: time_diff_minutes
+    dataType: NUMBER(38,0)
+    description: Worked - scheduled duration in minutes (+ over, - under); NULL if no timesheet.
+    additiveType: additive
+  - name: cancellation_reason
+    dataType: VARCHAR
+    description: Cancellation reason; only when status_id = 2.
+  - name: cancellation_comment
+    dataType: VARCHAR
+    description: Cancellation comment; only when status_id = 2.
+  - name: timesheet_status
+    dataType: VARCHAR
+    description: Confirmed / Submitted / None.
+  - name: system_comments
+    dataType: VARCHAR
+    description: timesheet.comment (admin-generated note when present).
+  - name: company_id
+    dataType: NUMBER(38,0)
+    description: Company key. RLS key (with location_id).
+  - name: location_id
+    dataType: NUMBER(38,0)
+    description: Location key. RLS key (with company_id).

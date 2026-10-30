@@ -1,0 +1,34 @@
+name: mart__continuity_report
+schema: care_management
+description: Continuity of Care, one row per client per service date per carer, full history / all dates. Ports continuityReport.php.
+grain: One row per client_key + service_date + carer_key
+modelRole: periodic-snapshot
+rationale:
+  purpose: The same fact serves BOTH halves of the report — the Period columns read the current filter, the Year columns re-apply it snapped out to whole calendar years, so the two can never desynchronise.
+  grainChoice: The headline metric is 1 - COUNT(DISTINCT carerId) / COUNT(id), which is NOT additive and therefore cannot be stored against a date range at all. The carer stays on the grain and Power BI takes DISTINCTCOUNT(carer_id) after the date filter. No job type — the report covers all visit types equally.
+  measures: Deliberately thin. Every displayed column is a DAX measure; see docs/powerbi_continuity_report_measures.md. Display columns live in mart__dim_client and mart__dim_carer.
+  design: Incremental (merge) on source + client_id + service_date + carer_id; rolling 60-day re-merge, older backfills need --full-refresh.
+columns:
+  - name: source
+    dataType: VARCHAR
+    description: Tenant token of the source schema the row came from. Opens the grain and the incremental merge key, and part of every relationship to a dimension.
+    isNaturalKey: true
+  - name: service_date
+    dataType: DATE
+    description: Service date (timesheet.logDate). Grain with client_id + carer_id; the Power BI date filter and the relationship to dim_date.
+    isNaturalKey: true
+    isForeignKey: true
+  - name: client_key
+    dataType: NUMBER(38,0)
+    description: Power BI relationship key to dim_client — source_key(source, client_id). client_id alone repeats across cares, so relating on the bare id would join one care's client to another's.
+    isForeignKey: true
+    isNaturalKey: true
+  - name: carer_key
+    dataType: NUMBER(38,0)
+    description: Power BI relationship key to dim_carer — source_key(source, carer_id). The -1 sentinel yields source_key(source, -1), which matches no dim_carer row and lands on the blank member. DISTINCTCOUNT for the Carers measure stays on carer_id within a care; use carer_key if a visual ever spans cares.
+    isForeignKey: true
+    isNaturalKey: true
+  - name: visit_count
+    dataType: NUMBER(38,0)
+    description: COUNT of delivered timesheets (timeType IS NULL) for this client/date/carer — the report's "Visits" figure and the denominator of the continuity ratio. Additive and unrounded, so any date-range SUM is exact.
+    additiveType: additive

@@ -1,0 +1,87 @@
+name: mart__carer_qualification_report
+schema: care_management
+description: Carer Qualification Export, one row per carer x qualification record (a carer with N qualifications shows N rows; a carer with none shows one row with null qualification columns). Ports carerQualificationExport.php.
+grain: One row per carer_key + qualification_record_id
+modelRole: transaction-fact
+rationale:
+  purpose: Serves two consumers off one grain — the flat export, and the HR compliance dashboard whose KPI tiles and drill-downs read expire_status / is_expiring / is_renewal / days_to_expiry on the same rows.
+  design: Flat detail report, all display columns denormalised, so the dim_carer relationship is OPTIONAL — carer_key is here so every fact in the account offers the same one. Direct-join report (no date expansion) so it is a full table rebuild. The dashboard's active/pending scope (state_id in (1,2)) is a report-side filter, not a mart filter; the export must keep every carer.
+  measures: No stored measures. Count HR FILES with DISTINCTCOUNT(qualification_record_id) — COUNTROWS would also count the carer-with-no-file rows.
+columns:
+  - name: source
+    dataType: VARCHAR
+    description: Tenant token of the source schema the row came from. Opens the grain and part of every relationship to a dimension.
+    isNaturalKey: true
+  - name: qualification_record_id
+    dataType: NUMBER(38,0)
+    description: Qualification record key (cmQualifications.id); null on the row a carer with no qualifications produces. Part of the grain.
+    isNaturalKey: true
+  - name: carer_key
+    dataType: NUMBER(38,0)
+    description: Power BI relationship key to dim_carer — source_key(source, carer_id). Optional here because the export denormalises the carer columns it displays.
+    isForeignKey: true
+    isNaturalKey: true
+  - name: hr_file_key
+    dataType: NUMBER(38,0)
+    description: Power BI relationship key to dim_hrfile — source_key(source, qualification_type_id). source_key(source, -1) (carer holds no qualification record) matches no dimension row and lands on the blank member.
+    isForeignKey: true
+  - name: qualification_key
+    dataType: NUMBER(38,0)
+    description: Row key — source_key(source, qualification_record_id). The "one" side for mart__search_index, which needs a single unique column and this fact has none. Carers holding no qualification take the negated carer key, -source_key(source, carer_id), so they stay one row each.
+    isPrimaryKey: true
+  - name: carer_no
+    dataType: VARCHAR
+    description: Front-end carer display id (carer.carerId).
+  - name: qualification_name
+    dataType: VARCHAR
+    description: Qualification type name; render in red when is_type_deleted is true.
+  - name: is_type_deleted
+    dataType: BOOLEAN
+    description: True when the company has retired this HR file type. Never null. Rows for retired types are kept deliberately (audit lookback) — mark them, do not filter them out.
+  - name: awarded
+    dataType: DATE
+    description: Award date; blank/null for missing or zero dates.
+  - name: expired
+    dataType: DATE
+    description: Expiry date; blank/null when the file has no expiry.
+  - name: expire_status
+    dataType: VARCHAR
+    description: >-
+      The file's status — 'not_actioned' (neither date filled) / 'expired'
+      (expireDate <= today, so a file expiring TODAY is expired) / 'valid'.
+      Mutually exclusive and exhaustive; null where the carer holds no
+      qualification record.
+  - name: days_to_expiry
+    dataType: NUMBER(38,0)
+    description: Whole days from the build date to the expiry — 0 means it expires today, negative means overdue, null when there is no expiry. As-of the build date, so it is only right while the daily refresh runs.
+    additiveType: non-additive
+  - name: is_expiring
+    dataType: BOOLEAN
+    description: Still valid, but inside its type's own alert window (cmQualificationsType.alertBefore, a calendar interval such as '4 week'), which runs from the expiry date minus that interval to the day before expiry. An OVERLAY on expire_status = 'valid', NOT a fourth state — never add it to a valid + expired total.
+  - name: is_renewal
+    dataType: BOOLEAN
+    description: True when the record replaced an earlier file (cmQualifications.multiple = 1).
+  - name: state
+    dataType: VARCHAR
+    description: Carer state name; state 3 shown as 'Archived'.
+  - name: state_id
+    dataType: NUMBER(38,0)
+    description: Raw carer state code (1 active, 2 pending, 3 archived). The compliance dashboard's scope filter — state_id in (1, 2) — belongs on the report, not in this mart.
+  - name: area_id
+    dataType: NUMBER(38,0)
+    description: "The carer's area id (carer.area as a number). Branch-level RLS key: the TenantArea role keeps rows whose area belongs to one of the admin's allowed workgroups (mart__area_scope)."
+  - name: modified_by
+    dataType: VARCHAR
+    description: Full name of the carer who last modified the qualification record.
+  - name: file_uploaded
+    dataType: VARCHAR
+    description: '"Yes" if any file is attached (multiple-files table or legacy fileName), else "No".'
+  - name: comments
+    dataType: VARCHAR
+    description: Free-text note on the qualification record.
+  - name: company_id
+    dataType: NUMBER(38,0)
+    description: Company key. RLS key (with location_id).
+  - name: location_id
+    dataType: NUMBER(38,0)
+    description: Location key. RLS key (with company_id).

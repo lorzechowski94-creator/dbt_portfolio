@@ -1,0 +1,125 @@
+name: mart__all_carers_report
+schema: care_management
+description: "All Carers. One row per Active, Pending or Archived care worker the legacy All Carers page lists, whatever their area, workgroup or branch; flat list, no dates, no totals. Ports carersTotalAll.php / carerTblTotalAll.php."
+grain: "One row per source + carer_id (carer_key)"
+modelRole: domain-dim
+rationale:
+  purpose: "A flat carer list with every column the legacy page can show, current state only."
+  roleChoice: "Stands apart from mart__dim_carer, which holds current carers only (deleted IS NULL) and would drop the Pending and Archived carers this list keeps."
+  design: "The legacy tab is the state slicer. Branch and Workgroup slice through mart__bridge_carer_workgroup, Tags through mart__bridge_carer_tag, both on carer_key; location names come from mart__dim_location. Also the base of all_carers_sv. Column semantics, legacy quirks and the area handling are documented on int__all_carers."
+columns:
+  - name: source
+    dataType: "VARCHAR"
+    description: "Tenant token of the source schema the row came from. Opens the grain."
+    isNaturalKey: true
+  - name: carer_key
+    dataType: "NUMBER(38,0)"
+    description: "source_key(source, carer_id) — unique on its own; the one side of the relationships from mart__bridge_carer_tag and mart__bridge_carer_workgroup. Same value as mart__dim_carer's key."
+    isPrimaryKey: true
+  - name: carer_id
+    dataType: "NUMBER(38,0)"
+    description: "Carer primary key (carer.id). Grain WITH source — the id is allocated per care and repeats across them."
+    isNaturalKey: true
+  - name: carer_no
+    dataType: "VARCHAR"
+    description: "The report's No. column — carerNum on the R3 servers, carerId elsewhere."
+  - name: has_private_note
+    dataType: "BOOLEAN"
+    description: "Private-note warning icon in front of No. (carer.privateNote = 1)."
+  - name: has_future_status_change
+    dataType: "BOOLEAN"
+    description: "Future-status icon in front of No. — a status change still to run."
+  - name: first_name
+    dataType: "VARCHAR"
+    description: "First name (fname)."
+  - name: surname
+    dataType: "VARCHAR"
+    description: "Surname (sname); the legacy Name column sorts by it."
+  - name: full_name
+    dataType: "VARCHAR"
+    description: "The report's Name column — first name + surname."
+  - name: gender
+    dataType: "VARCHAR"
+    description: "The report's Gender column (sex), free text in the source."
+  - name: address
+    dataType: "VARCHAR"
+    description: "The report's Address column — address line 1, town, county, post code, blanks skipped."
+  - name: address_line_1
+    dataType: "VARCHAR"
+    description: "Address line 1 (carer.address1); with town, what the Address search matches."
+  - name: town
+    dataType: "VARCHAR"
+    description: "Town."
+  - name: county
+    dataType: "VARCHAR"
+    description: "The report's County column."
+  - name: post_code
+    dataType: "VARCHAR"
+    description: "The report's Post Code column."
+  - name: area_id
+    dataType: "NUMBER(38,0)"
+    description: "The carer's area id (carer.area as a number); null when the carer has no area. Branch-level RLS key for the TenantArea role (mart__area_scope), which hides a null under an area limit (decided 2026-10-27)."
+  - name: area_name
+    dataType: "VARCHAR"
+    description: "The report's Area column; null when no area row holds that id."
+  - name: phone
+    dataType: "VARCHAR"
+    description: "The report's Phone column."
+  - name: phone2
+    dataType: "VARCHAR"
+    description: "Second phone; not displayed, but the Phone search matches it."
+  - name: email
+    dataType: "VARCHAR"
+    description: "The report's E-Mail column."
+  - name: tags
+    dataType: "VARCHAR"
+    description: "The report's Tags column, comma-joined in tag category order. Filter through mart__bridge_carer_tag."
+  - name: status_id
+    dataType: "NUMBER(38,0)"
+    description: "Status key (carer.statusId as a number)."
+  - name: status
+    dataType: "VARCHAR"
+    description: "The report's Status column (status.type)."
+  - name: status_colour
+    dataType: "VARCHAR"
+    description: "Status colour (status.colour), a Bootstrap 3 context class (info, danger, primary, success, warning), not a colour code. Map it before using it for conditional formatting."
+  - name: status_change_date
+    dataType: "DATE"
+    description: "The report's Status Change column — dateChange of the latest status change."
+  - name: status_comment
+    dataType: "VARCHAR"
+    description: "The report's Comment column — the note of the latest status change."
+  - name: transport_type_id
+    dataType: "NUMBER(38,0)"
+    description: "Raw transport type code."
+  - name: transport_type
+    dataType: "VARCHAR"
+    description: "The report's Transport Type column — Driving / Walking / Cycle / Bus / public / Motorcycle."
+  - name: known_as
+    dataType: "VARCHAR"
+    description: "The report's Known As column; headed \"Agent Ref\" for company 164."
+  - name: pay_cycle
+    dataType: "VARCHAR"
+    description: "The report's Pay Cycle column — Weekly payroll / Monthly payroll."
+  - name: is_pay_cycle_loaded
+    dataType: "BOOLEAN"
+    description: "False for a source whose cmCarerBank is not ingested yet; its null pay_cycle then means not loaded."
+  - name: nationality
+    dataType: "VARCHAR"
+    description: "The report's Nationality column, each word capitalised."
+  - name: state_id
+    dataType: "NUMBER(38,0)"
+    description: "Raw state code — 1 Active, 2 Pending, 3 Archived."
+  - name: state
+    dataType: "VARCHAR"
+    description: "The report's state — Active / Pending / Archived (the legacy tabs)."
+  - name: location_key
+    dataType: "NUMBER(38,0)"
+    description: "Relationship key to mart__dim_location — source_key(source, location_id)."
+    isForeignKey: true
+  - name: company_id
+    dataType: "NUMBER(38,0)"
+    description: "Company key (carer.companyId). RLS key (with location_id)."
+  - name: location_id
+    dataType: "NUMBER(38,0)"
+    description: "Location key (carer.location). RLS key (with company_id)."

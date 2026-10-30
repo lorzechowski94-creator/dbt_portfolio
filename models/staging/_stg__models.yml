@@ -1,0 +1,47 @@
+version: 2
+
+# A representative sample of the staging layer: each model reads its raw_access
+# view and de-duplicates on the unique key.
+#
+# not_null on companyid / locationid / created is severity WARN, in every model.
+# BETA (R2, onboarded 2026-10) holds rows with them null, and a failing staging test
+# does not just redden the job: it sets GATE in .gitlab-ci.yml, which skips the
+# whole account's shared phase, i.e. every R2 mart. The warning still prints the
+# count. id keeps unique + not_null at ERROR: a broken key breaks the dedupe and
+# every join, and nothing should build over that.
+models:
+  - name: stg__client
+    description: Current client records from the client snapshot, deduped on id.
+    columns:
+      - name: id
+        tests: [unique, not_null]
+      - name: companyid
+        tests: [{not_null: {config: {severity: warn}}}]
+  - name: stg__company
+    description: Current company records, deduped on id.
+    columns:
+      - name: id
+        tests: [unique, not_null]
+  - name: stg__location
+    description: Current location records, deduped on id.
+    columns:
+      - name: id
+        tests: [unique, not_null]
+  # No not_null on companyid/locationid: care2 holds rows with a null RLS key
+  # (5292 at the time of writing; care1 has none in 60.2M). The intermediate
+  # models drop a row with a null location instead, so the reports count
+  # location-attributed rows only. raw_access does show such a row, but only to
+  # the company-wide reader of its company (customer_access_filter): a location
+  # reader never sees it, and a null companyid hides it from everyone. So that
+  # reader's raw_access counts can exceed its reports by exactly these rows.
+  - name: stg__timesheet
+    description: Current timesheet records from the timesheet snapshot, deduped on id. Grain of the report.
+    columns:
+      - name: id
+        tests: [unique, not_null]
+  - name: stg__status
+    description: >
+      Status lookup (passthrough over raw_access). Maps status id -> label (`type`) and
+      `colour`; read for client.state, client.statusId and carer.statusId.
+  - name: stg__state
+    description: Carer state lookup (passthrough over raw_access). Maps state id -> name; state 3 is displayed as "Archived" downstream.

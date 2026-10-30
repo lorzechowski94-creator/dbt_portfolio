@@ -1,0 +1,126 @@
+name: mart__plans_taken_report
+schema: care_management
+description: "Plans Taken. One row per plan started for a client or a carer (cmFormsPlansTaken), full history, both types; flat list, no aggregation and no totals row. Ports plansTakenReport.php (All Plans Taken)."
+grain: "One row per source + plan_taken_id (plan_taken_key)"
+modelRole: accumulating-snapshot
+rationale:
+  purpose: "The legacy page's list of plans taken, with every column it can show, for all dates and both person types at once."
+  roleChoice: "An accumulating snapshot: one row per plan, rebuilt in full each run, carrying its milestones (started, completed, review) as dates on the row. It relates to mart__dim_date three times, once per milestone, and to mart__dim_location; a row is EITHER a client's or a carer's plan, so it relates to neither person dimension."
+  grainChoice: "The page lists one row per plan taken; every version of a reviewed plan is its own row, linked forward by next_plan_taken_id."
+  design: "The page's Type is person_type and its From / To window applies to started_date, review_date or completed_date as its Search choice says: Started is the active date relationship, the other two are inactive and switched with USERELATIONSHIP. One person rule for every viewer (the person exists and is not deleted, and a carer plan belongs to a care worker, not an admin profile), where the page has one for restricted and one for unrestricted admins. Column semantics and the row set are documented on int__plans_taken."
+columns:
+  - name: source
+    dataType: "VARCHAR"
+    description: "Tenant token of the source schema the row came from. Opens the grain."
+    isNaturalKey: true
+  - name: plan_taken_key
+    dataType: "NUMBER(38,0)"
+    description: "source_key(source, plan_taken_id) — unique on its own."
+    isPrimaryKey: true
+  - name: plan_taken_id
+    dataType: "NUMBER(38,0)"
+    description: "Plan taken primary key (cmFormsPlansTaken.id). Grain WITH source — the id is allocated per care and repeats across them."
+    isNaturalKey: true
+  - name: person_type
+    dataType: "VARCHAR"
+    description: "'client' or 'carer' — the report's Type."
+  - name: person_type_label
+    dataType: "VARCHAR"
+    description: "Display form of person_type — Client / Carer."
+  - name: person_id
+    dataType: "NUMBER(38,0)"
+    description: "client.id or carer.id, the person the plan is for. Not unique on its own."
+  - name: person_key
+    dataType: "NUMBER(38,0)"
+    description: "The person in one integer (source_code * 10^13 + (1 client, 2 carer) * 10^12 + person_id), as on mart__birthday_report."
+  - name: first_name
+    dataType: "VARCHAR"
+    description: "First name (fname)."
+  - name: surname
+    dataType: "VARCHAR"
+    description: "Surname (sname); the legacy name column sorts by it."
+  - name: full_name
+    dataType: "VARCHAR"
+    description: "The report's Client / Carer column — first name + surname."
+  - name: person_state_id
+    dataType: "NUMBER(38,0)"
+    description: "The person's state — 1 Active, 2 Pending, 3 Archived."
+  - name: person_state
+    dataType: "VARCHAR"
+    description: "The report's State — Active / Pending / Archived."
+  - name: area_id
+    dataType: "NUMBER(38,0)"
+    description: "The person's area id. Branch-level RLS key for the TenantArea role (mart__area_scope)."
+  - name: area_name
+    dataType: "VARCHAR"
+    description: "The report's Area column."
+  - name: workgroup_names
+    dataType: "VARCHAR"
+    description: "The report's Work Group column — the area's live workgroups, comma-joined, from the same mapping as All Carers and All Clients (int__area_workgroup_branch). Display only."
+  - name: branch_names
+    dataType: "VARCHAR"
+    description: "The report's Branch column — the live branches of those workgroups, comma-joined. Display only."
+  - name: plan_id
+    dataType: "NUMBER(38,0)"
+    description: "Plan template id (cmFormsPlansTaken.planId)."
+  - name: plan_template_name
+    dataType: "VARCHAR"
+    description: "Template name (cmPlans.name), the Plan slicer value."
+  - name: plan_name
+    dataType: "VARCHAR"
+    description: "The report's Plan Name column — appendedPlanName when set, else the template name."
+  - name: started_at
+    dataType: "TIMESTAMP_NTZ"
+    description: "The report's Started column (created)."
+  - name: started_date
+    dataType: "DATE"
+    description: "started_at as a date — the active date relationship."
+    isForeignKey: true
+  - name: started_by_id
+    dataType: "NUMBER(38,0)"
+    description: "createdBy, the user who started the plan."
+  - name: started_by
+    dataType: "VARCHAR"
+    description: "The report's Started By column."
+  - name: completed_at
+    dataType: "TIMESTAMP_NTZ"
+    description: "The report's Completed column; null while pending."
+  - name: completed_date
+    dataType: "DATE"
+    description: "completed_at as a date — inactive date relationship (Search = Completed Dates)."
+    isForeignKey: true
+  - name: is_completed
+    dataType: "BOOLEAN"
+    description: "True once completed_at is set."
+  - name: completion_status
+    dataType: "VARCHAR"
+    description: "Completed / Pending."
+  - name: completed_by_id
+    dataType: "NUMBER(38,0)"
+    description: "completedBy."
+  - name: completed_by
+    dataType: "VARCHAR"
+    description: "The report's Completed By column."
+  - name: review_date
+    dataType: "DATE"
+    description: "The report's Review Date column — inactive date relationship (Search = Review Dates)."
+    isForeignKey: true
+  - name: next_plan_taken_id
+    dataType: "NUMBER(38,0)"
+    description: "The plan taken that followed this one at its review (nextPlan). Not on the legacy page."
+  - name: is_superseded
+    dataType: "BOOLEAN"
+    description: "A newer, live version of this plan exists. Not on the legacy page."
+  - name: is_signed_off
+    dataType: "BOOLEAN"
+    description: "The report's Sign Off column — at least one live signature."
+  - name: location_key
+    dataType: "NUMBER(38,0)"
+    description: "Relationship key to mart__dim_location — source_key(source, location_id)."
+    isForeignKey: true
+  - name: company_id
+    dataType: "NUMBER(38,0)"
+    description: "Company key (cmFormsPlansTaken.companyId). RLS key (with location_id)."
+  - name: location_id
+    dataType: "NUMBER(38,0)"
+    description: "Location key (cmFormsPlansTaken.locationId). RLS key (with company_id)."

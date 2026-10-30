@@ -23,6 +23,8 @@ version: 2
 #
 # mart__dim_date is the exception: a generated calendar, identical for every care,
 # so it carries no `source` column and is simply built once.
+# mart__bom_explosion is the other: a self-contained PLM example over the sample
+# parts in seeds/bom/, with no care in it at all.
 models:
   - name: mart__client_hours_report
     description: >
@@ -2481,3 +2483,101 @@ models:
       - name: location_id
         description: The schedule's location. RLS key (with company_id).
         tests: [not_null]
+
+  - name: mart__bom_explosion
+    description: >
+      Exploded bill of materials: one row per node of every product structure, with
+      each latest part version in the Design / Manufacturing / Service views as a
+      top-level part, so any part can be picked as the root of an indented BOM.
+      Fixed depth (21 levels): the model header says how the tree is unrolled, and
+      why node attributes are read from the node's own level and rows are not
+      DISTINCT.
+    columns:
+      - name: part_number
+        description: Part number of the TOP-LEVEL part this row's structure belongs to (not the node's; that is component_number).
+      - name: top_level_parent
+        description: Top-level part name and number, for display.
+      - name: top_level_view
+        description: View of the top-level part (Design / Manufacturing / Service).
+      - name: component_number
+        description: Part number of the node this row represents.
+      - name: view
+        description: View of the node's part.
+      - name: level
+        description: Depth of the node; 0 is the top-level part itself.
+        tests: [not_null]
+      - name: structure_name
+        description: Node part name indented by level (' |  ' per level), for an indented BOM display.
+      - name: component_quantity
+        description: Quantity on the usage link that brought the node in. Null for the top-level part.
+      - name: computed_component_quantity
+        description: >
+          Quantity of the node per ONE top-level part: the product of the quantities
+          along the path (a missing quantity counts as 1). Each physical branch is a
+          row of its own, so summing this per component_number gives the total.
+      - name: spare_part_indicator
+        description: The node's own flag from its usage link. Null for the top-level part; never inherited from the parent.
+      - name: lowest_replaceable_unit
+        description: The node's own flag from its usage link. Null for the top-level part; never inherited from the parent.
+      - name: reference_designator
+        description: The node's own reference designator. Null when its usage link has none; never inherited from the parent.
+      - name: parent_part_number
+        description: Part number of the node's direct parent. Null for the top-level part.
+      - name: parent_wtpart_master_key
+        description: Master key of the node's direct parent. Null for the top-level part.
+      - name: wtpart_usage_key
+        description: Key of the usage link that brought the node in. Null for the top-level part.
+      - name: component_wtpart_master_key
+        description: Master key of the node's part.
+      - name: full_parent_hierarchy
+        description: Part numbers from the top-level part down to the node, joined with ' -> '.
+      - name: hierarchy_sort_order
+        description: >
+          Depth-first display order: by top-level view, then the path of part numbers
+          and usage keys, so every node sorts directly under its own parent instance
+          and siblings sort by part number.
+      - name: is_depth_truncated
+        description: True when the node sits at the maximum depth and still has children, i.e. its subtree was cut off.
+        tests:
+          - accepted_values:
+              arguments:
+                values: [false]
+                quote: false
+              config:
+                severity: warn
+      - name: bom_path_key
+        description: "One per row: md5 of the top-level part (view + master key) and the path of usage links to the node."
+        tests: [unique, not_null]
+      - name: parent_child_key
+        description: md5 of the node's own link (component master key | parent master key | view). Repeats wherever the same link appears in several structures.
+
+unit_tests:
+  - name: mart__bom_explosion_reads_each_node_from_its_own_level
+    description: >
+      The bike uses the same wheel twice (FRONT and REAR). Each wheel keeps its own
+      subtree, so the spoke appears twice with 32 per wheel, and neither the spoke
+      nor the rim inherits the wheel's reference designator.
+    model: mart__bom_explosion
+    given:
+      - input: ref('part_version')
+        rows:
+          - {component_wtpart_master_key: 100, part_number: BK-100, part_name: Bike, view: Design, latest_view_iteration: true}
+      - input: ref('material_bom')
+        rows:
+          - {parent_wtpart_master_key1: 100, parent_part_view: Design, wtpart_usage_key: 1001, component_wtpart_master_key: 200, part_number: FR-200, part_view: Design, component_quantity: 1}
+          - {parent_wtpart_master_key1: 100, parent_part_view: Design, wtpart_usage_key: 1002, component_wtpart_master_key: 300, part_number: WH-300, part_view: Design, component_quantity: 1, reference_designator: FRONT}
+          - {parent_wtpart_master_key1: 100, parent_part_view: Design, wtpart_usage_key: 1003, component_wtpart_master_key: 300, part_number: WH-300, part_view: Design, component_quantity: 1, reference_designator: REAR}
+          - {parent_wtpart_master_key1: 300, parent_part_view: Design, wtpart_usage_key: 1004, component_wtpart_master_key: 310, part_number: SP-310, part_view: Design, component_quantity: 32}
+          - {parent_wtpart_master_key1: 300, parent_part_view: Design, wtpart_usage_key: 1005, component_wtpart_master_key: 320, part_number: RM-320, part_view: Design, component_quantity: 1}
+          - {parent_wtpart_master_key1: 200, parent_part_view: Design, wtpart_usage_key: 1006, component_wtpart_master_key: 400, part_number: BT-400, part_view: Design, component_quantity: 4}
+    expect:
+      rows:
+        - {component_number: BK-100, level: 0, reference_designator: null, computed_component_quantity: 1}
+        - {component_number: FR-200, level: 1, reference_designator: null, computed_component_quantity: 1}
+        - {component_number: BT-400, level: 2, reference_designator: null, computed_component_quantity: 4}
+        - {component_number: WH-300, level: 1, reference_designator: FRONT, computed_component_quantity: 1}
+        - {component_number: RM-320, level: 2, reference_designator: null, computed_component_quantity: 1}
+        - {component_number: SP-310, level: 2, reference_designator: null, computed_component_quantity: 32}
+        - {component_number: WH-300, level: 1, reference_designator: REAR, computed_component_quantity: 1}
+        - {component_number: RM-320, level: 2, reference_designator: null, computed_component_quantity: 1}
+        - {component_number: SP-310, level: 2, reference_designator: null, computed_component_quantity: 32}

@@ -1,0 +1,11 @@
+component_wtpart_master_key,part_number,part_name,view,latest_view_iteration
+100,BK-100,Bike,Design,true
+100,BK-100,Bike,Manufacturing,true
+100,BK-100,Bike,Service,false
+200,FR-200,Frame,Design,true
+200,FR-200,Frame,Manufacturing,true
+300,WH-300,Wheel,Design,true
+310,SP-310,Spoke,Design,true
+320,RM-320,Rim,Design,true
+400,BT-400,Bolt,Design,true
+400,BT-400,Bolt,Manufacturing,true
